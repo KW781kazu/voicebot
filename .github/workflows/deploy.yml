@@ -3,7 +3,7 @@ name: Deploy to ECS (same-tag rollout)
 on:
   push:
     branches: [ "main" ]
-workflow_dispatch: {}
+workflow_dispatch:   # ← 値は空でOK（: の後ろは何も書かない）
 
 env:
   AWS_REGION: ap-northeast-1
