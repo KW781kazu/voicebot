@@ -1,17 +1,15 @@
-FROM public.ecr.aws/docker/library/python:3.11-slim
-
-# system deps（できるだけ軽く）
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+# Dockerfile（requirements.txt に fastapi/uvicorn あり版）
+FROM python:3.11-slim
 
 WORKDIR /app
-COPY requirements.txt ./
+
+# 依存は一括で requirements.txt から入れる（キャッシュ効かせるために先にコピー）
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py ./
+# アプリ & デプロイスタンプ
+COPY app.py ./app.py
+COPY DEPLOY_STAMP.txt ./DEPLOY_STAMP.txt
 
-# FastAPI起動（ALBからは80番で到達する前提：ECS側でポートマッピング）
-ENV PORT=8080
 EXPOSE 8080
-
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080", "--no-server-header"]
-
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
