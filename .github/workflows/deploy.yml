@@ -48,15 +48,13 @@ jobs:
           echo "redeploy $(date -u +%Y-%m-%dT%H:%M:%SZ) $GITHUB_SHA" > DEPLOY_STAMP.txt
           cat DEPLOY_STAMP.txt
 
-      - name: Build and push image (with cache)
+      - name: Build and push image
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
           file: ./Dockerfile
+          tags: ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}
 
       - name: Force new deployment (same tag pull)
         run: |
