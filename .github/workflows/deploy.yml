@@ -9,16 +9,18 @@ env:
   ACCOUNT_ID: "291234479055"
   ECR_REPO: voicebot
   IMAGE_TAG: v1
+
   CLUSTER_ARN: arn:aws:ecs:ap-northeast-1:291234479055:cluster/voicebot-cluster
   SERVICE_ARN: arn:aws:ecs:ap-northeast-1:291234479055:service/voicebot-cluster/svc-voicebot
 
-  # ← ここだけ環境に合わせて変更してください
-  DOCKER_CONTEXT: ./voicebot
-  DOCKERFILE: ./voicebot/Dockerfile
+  # Dockerfile が直下にある場合
+  DOCKER_CONTEXT: ./
+  DOCKERFILE: ./Dockerfile
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,8 +32,15 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Login to Amazon ECR
-        uses: aws-actions/amazon-ecr-login@v2
+      # ← まず実際にどのアカウント／ユーザーで実行されているか確認
+      - name: Who am I (STS)
+        run: aws sts get-caller-identity
+
+      # ← Actionプラグインではなく、明示的なログインに切替
+      - name: Login to Amazon ECR (explicit)
+        run: |
+          aws ecr get-login-password --region "${{ env.AWS_REGION }}" \
+            | docker login --username AWS --password-stdin "${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
 
       - name: Build and push image
         uses: docker/build-push-action@v5
