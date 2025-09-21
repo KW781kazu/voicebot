@@ -12,23 +12,36 @@ env:
   CLUSTER_ARN: arn:aws:ecs:ap-northeast-1:291234479055:cluster/voicebot-cluster
   SERVICE_ARN: arn:aws:ecs:ap-northeast-1:291234479055:service/voicebot-cluster/svc-voicebot
 
+  # ← ここだけ環境に合わせて変更してください
+  DOCKER_CONTEXT: ./voicebot
+  DOCKERFILE: ./voicebot/Dockerfile
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: aws-actions/configure-aws-credentials@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
-      - uses: aws-actions/amazon-ecr-login@v2
-      - uses: docker/build-push-action@v5
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
         with:
-          context: .
+          context: ${{ env.DOCKER_CONTEXT }}
+          file: ${{ env.DOCKERFILE }}
           push: true
           tags: ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}
-      - name: Force new deployment
+
+      - name: Force new deployment (same tag pull)
         run: |
           aws ecs update-service \
             --cluster "${{ env.CLUSTER_ARN }}" \
