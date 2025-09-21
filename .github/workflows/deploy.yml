@@ -2,8 +2,9 @@ name: Deploy to ECS (same-tag rollout)
 
 on:
   push:
-    branches: [ "main" ]
-  workflow_dispatch: {}   # ← この位置が正しい
+    branches:
+      - main
+  workflow_dispatch:
 
 env:
   AWS_REGION: ap-northeast-1
@@ -25,22 +26,36 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - run: aws sts get-caller-identity
+      - name: Who am I (STS)
+        run: aws sts get-caller-identity
 
-      - uses: aws-actions/amazon-ecr-login@v2
+      - name: Ensure ECR repository exists
+        run: |
+          aws ecr describe-repositories --repository-names "$ECR_REPO" || \
+          aws ecr create-repository --repository-name "$ECR_REPO"
+
+      - name: Login to Amazon ECR (explicit)
+        run: |
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
       - name: Write deploy stamp (auto)
-        run: echo "{ \"deployed_at\": \"$(date -u +'%Y-%m-%dT%H:%M:%SZ')\" }" > deploy_stamp.json
+        run: |
+          echo "redeploy $(date -u +%Y-%m-%dT%H:%M:%SZ) $GITHUB_SHA" > DEPLOY_STAMP.txt
+          cat DEPLOY_STAMP.txt
 
-      - uses: docker/build-push-action@v5
+      - name: Build and push image
+        uses: docker/build-push-action@v5
         with:
           context: .
           push: true
+          file: ./Dockerfile
           tags: ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}
 
       - name: Force new deployment (same tag pull)
         run: |
           aws ecs update-service \
-            --cluster ${{ env.CLUSTER_ARN }} \
-            --service ${{ env.SERVICE_ARN }} \
-            --force-new-deployment
+            --cluster "$CLUSTER_ARN" \
+            --service "$SERVICE_ARN" \
+            --force-new-deployment \
+            --region "$AWS_REGION"
