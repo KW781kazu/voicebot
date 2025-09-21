@@ -12,7 +12,7 @@ env:
   CLUSTER_ARN: arn:aws:ecs:ap-northeast-1:291234479055:cluster/voicebot-cluster
   SERVICE_ARN: arn:aws:ecs:ap-northeast-1:291234479055:service/voicebot-cluster/svc-voicebot
 
-  # ← パス指定用（Dockerの予約変数と衝突しない名前に変更）
+  # ← ここで Dockerfile の位置を指定（直下ならこのまま）
   BUILD_CONTEXT: ./
   DOCKERFILE_PATH: ./Dockerfile
 
@@ -48,13 +48,15 @@ jobs:
           aws ecr get-login-password --region "${{ env.AWS_REGION }}" \
             | docker login --username AWS --password-stdin "${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
 
-      - name: Build and push image
+      - name: Build and push image (with cache)
         uses: docker/build-push-action@v5
         with:
           context: ${{ env.BUILD_CONTEXT }}
           file: ${{ env.DOCKERFILE_PATH }}
           push: true
           tags: ${{ steps.ensure.outputs.repo_uri }}:${{ env.IMAGE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Force new deployment (same tag pull)
         run: |
