@@ -34,8 +34,5 @@ def health():
 @app.get("/version")
 def version():
     stamp = _read_deploy_stamp()
-    env = {
-        "image_tag": os.getenv("IMAGE_TAG"),
-        "aws_region": os.getenv("AWS_REGION"),
-    }
+    env = {"image_tag": os.getenv("IMAGE_TAG"), "aws_region": os.getenv("AWS_REGION")}
     return JSONResponse({"app": "voicebot", "deploy_stamp": stamp, "env": env})
