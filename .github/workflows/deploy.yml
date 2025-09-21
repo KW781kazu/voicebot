@@ -12,7 +12,7 @@ env:
   CLUSTER_ARN: arn:aws:ecs:ap-northeast-1:291234479055:cluster/voicebot-cluster
   SERVICE_ARN: arn:aws:ecs:ap-northeast-1:291234479055:service/voicebot-cluster/svc-voicebot
 
-  # Dockerfile の場所（直下ならこのまま。サブフォルダなら後述）
+  # Dockerfile の場所（直下ならこのまま。サブフォルダなら下の2行を実パスに変更）
   BUILD_CONTEXT: ./
   DOCKERFILE_PATH: ./Dockerfile
 
@@ -49,17 +49,27 @@ jobs:
           aws ecr get-login-password --region "${{ env.AWS_REGION }}" \
             | docker login --username AWS --password-stdin "${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
 
-      # ★ Buildx を docker-container ドライバでセットアップ（cache: gha が使えるように）
+      # ← Buildx をセットアップ（キャッシュ利用のため必須）
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push image (with cache)
+      # ← 手動でDEPLOY_STAMP.txt作成する代わりに、毎回自動で書き込む
+      - name: Write deploy stamp (auto)
+        shell: bash
+        run: |
+          echo "redeploy $(date -u +'%Y-%m-%dT%H:%M:%SZ') $GITHUB_SHA" > DEPLOY_STAMP.txt
+          cat DEPLOY_STAMP.txt
+
+      - name: Build and push image (with cache, multi tags)
         uses: docker/build-push-action@v5
         with:
           context: ${{ env.BUILD_CONTEXT }}
           file: ${{ env.DOCKERFILE_PATH }}
           push: true
-          tags: ${{ steps.ensure.outputs.repo_uri }}:${{ env.IMAGE_TAG }}
+          # v1 は固定（ECSはこれをpull）。追跡用にコミットSHAタグも同時push
+          tags: |
+            ${{ steps.ensure.outputs.repo_uri }}:${{ env.IMAGE_TAG }}
+            ${{ steps.ensure.outputs.repo_uri }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
