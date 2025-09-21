@@ -12,13 +12,14 @@ env:
   CLUSTER_ARN: arn:aws:ecs:ap-northeast-1:291234479055:cluster/voicebot-cluster
   SERVICE_ARN: arn:aws:ecs:ap-northeast-1:291234479055:service/voicebot-cluster/svc-voicebot
 
-  # ← ここで Dockerfile の位置を指定（直下ならこのまま）
+  # Dockerfile の場所（直下ならこのまま。サブフォルダなら後述）
   BUILD_CONTEXT: ./
   DOCKERFILE_PATH: ./Dockerfile
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -47,6 +48,10 @@ jobs:
         run: |
           aws ecr get-login-password --region "${{ env.AWS_REGION }}" \
             | docker login --username AWS --password-stdin "${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+
+      # ★ Buildx を docker-container ドライバでセットアップ（cache: gha が使えるように）
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Build and push image (with cache)
         uses: docker/build-push-action@v5
