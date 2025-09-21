@@ -2,8 +2,9 @@ name: Deploy to ECS (same-tag rollout)
 
 on:
   push:
-    branches: [ "main" ]
-workflow_dispatch:   # ← 値は空でOK（: の後ろは何も書かない）
+    branches:
+      - main
+  workflow_dispatch:
 
 env:
   AWS_REGION: ap-northeast-1
@@ -13,71 +14,54 @@ env:
   CLUSTER_ARN: arn:aws:ecs:ap-northeast-1:291234479055:cluster/voicebot-cluster
   SERVICE_ARN: arn:aws:ecs:ap-northeast-1:291234479055:service/voicebot-cluster/svc-voicebot
 
-  # Dockerfile の場所（直下ならこのまま。サブフォルダなら下の2行を実パスに変更）
-  BUILD_CONTEXT: ./
-  DOCKERFILE_PATH: ./Dockerfile
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Print env / region
+        run: |
+          echo "REGION=$AWS_REGION  ACCOUNT_ID=$ACCOUNT_ID  REPO=$ECR_REPO  TAG=$IMAGE_TAG"
+
       - name: Who am I (STS)
         run: aws sts get-caller-identity
 
       - name: Ensure ECR repository exists
-        id: ensure
-        shell: bash
         run: |
-          set -euo pipefail
-          if ! aws ecr describe-repositories --repository-names "${ECR_REPO}" --region "${AWS_REGION}" >/dev/null 2>&1; then
-            aws ecr create-repository --repository-name "${ECR_REPO}" --region "${AWS_REGION}"
-          fi
-          echo "repo_uri=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}" >> "$GITHUB_OUTPUT"
+          aws ecr describe-repositories --repository-names "$ECR_REPO" || \
+          aws ecr create-repository --repository-name "$ECR_REPO"
 
       - name: Login to Amazon ECR (explicit)
         run: |
-          aws ecr get-login-password --region "${{ env.AWS_REGION }}" \
-            | docker login --username AWS --password-stdin "${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
-      # ← Buildx をセットアップ（キャッシュ利用のため必須）
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # ← 手動でDEPLOY_STAMP.txt作成する代わりに、毎回自動で書き込む
       - name: Write deploy stamp (auto)
-        shell: bash
         run: |
-          echo "redeploy $(date -u +'%Y-%m-%dT%H:%M:%SZ') $GITHUB_SHA" > DEPLOY_STAMP.txt
+          echo "redeploy $(date -u +%Y-%m-%dT%H:%M:%SZ) $GITHUB_SHA" > DEPLOY_STAMP.txt
           cat DEPLOY_STAMP.txt
 
-      - name: Build and push image (with cache, multi tags)
+      - name: Build and push image (with cache)
         uses: docker/build-push-action@v5
         with:
-          context: ${{ env.BUILD_CONTEXT }}
-          file: ${{ env.DOCKERFILE_PATH }}
+          context: .
           push: true
-          # v1 は固定（ECSはこれをpull）。追跡用にコミットSHAタグも同時push
-          tags: |
-            ${{ steps.ensure.outputs.repo_uri }}:${{ env.IMAGE_TAG }}
-            ${{ steps.ensure.outputs.repo_uri }}:${{ github.sha }}
+          tags: ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          file: ./Dockerfile
 
       - name: Force new deployment (same tag pull)
         run: |
           aws ecs update-service \
-            --cluster "${{ env.CLUSTER_ARN }}" \
-            --service "${{ env.SERVICE_ARN }}" \
+            --cluster   "$CLUSTER_ARN" \
+            --service   "$SERVICE_ARN" \
             --force-new-deployment \
-            --region "${{ env.AWS_REGION }}"
+            --region "$AWS_REGION"
