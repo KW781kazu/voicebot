@@ -9,18 +9,16 @@ env:
   ACCOUNT_ID: "291234479055"
   ECR_REPO: voicebot
   IMAGE_TAG: v1
-
   CLUSTER_ARN: arn:aws:ecs:ap-northeast-1:291234479055:cluster/voicebot-cluster
   SERVICE_ARN: arn:aws:ecs:ap-northeast-1:291234479055:service/voicebot-cluster/svc-voicebot
 
-  # Dockerfile が直下にある場合
+  # Dockerfile の位置（必要に応じて変更）
   DOCKER_CONTEXT: ./
   DOCKERFILE: ./Dockerfile
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,11 +30,31 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # ← まず実際にどのアカウント／ユーザーで実行されているか確認
+      - name: Print env / region
+        run: |
+          echo "REGION=${{ env.AWS_REGION }}"
+          echo "ACCOUNT_ID=${{ env.ACCOUNT_ID }}"
+          aws --version
+          docker --version
+
       - name: Who am I (STS)
         run: aws sts get-caller-identity
 
-      # ← Actionプラグインではなく、明示的なログインに切替
+      - name: Ensure ECR repository exists
+        id: ensure
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! aws ecr describe-repositories --repository-names "${ECR_REPO}" --region "${AWS_REGION}" > /dev/null 2>&1; then
+            echo "ECR repo ${ECR_REPO} not found. Creating..."
+            aws ecr create-repository \
+              --repository-name "${ECR_REPO}" \
+              --image-scanning-configuration scanOnPush=true \
+              --encryption-configuration encryptionType=AES256 \
+              --region "${AWS_REGION}"
+          fi
+          echo "repo_uri=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}" >> "$GITHUB_OUTPUT"
+
       - name: Login to Amazon ECR (explicit)
         run: |
           aws ecr get-login-password --region "${{ env.AWS_REGION }}" \
@@ -48,7 +66,7 @@ jobs:
           context: ${{ env.DOCKER_CONTEXT }}
           file: ${{ env.DOCKERFILE }}
           push: true
-          tags: ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}
+          tags: ${{ steps.ensure.outputs.repo_uri }}:${{ env.IMAGE_TAG }}
 
       - name: Force new deployment (same tag pull)
         run: |
