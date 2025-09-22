@@ -2,14 +2,15 @@ name: Deploy to ECS (same-tag rollout)
 
 on:
   push:
-    branches: [ "main" ]
+    branches:
+      - main
   workflow_dispatch:
 
 env:
   AWS_REGION: ap-northeast-1
   ACCOUNT_ID: "291234479055"
   ECR_REPO: voicebot
-  IMAGE_TAG: v1
+  IMAGE_TAG: ${{ github.sha }}  # ← ここがポイント：常にコミットSHAでタグ付け
   CLUSTER_ARN: arn:aws:ecs:ap-northeast-1:291234479055:cluster/voicebot-cluster
   SERVICE_ARN: arn:aws:ecs:ap-northeast-1:291234479055:service/voicebot-cluster/svc-voicebot
 
@@ -17,9 +18,9 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      # ① AWS 認証（いまはSecrets利用のまま）
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -27,43 +28,42 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # ② ECR ログイン
-      - name: Login to Amazon ECR
-        run: |
-          aws ecr get-login-password --region "${AWS_REGION}" \
-            | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+      - name: Who am I (STS)
+        run: aws sts get-caller-identity
 
-      # ③ デプロイスタンプを書き出し（/version で見えるやつ）
+      - name: Ensure ECR repository exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ecr describe-repositories --repository-names "${ECR_REPO}" >/dev/null 2>&1 || \
+          aws ecr create-repository --repository-name "${ECR_REPO}" >/dev/null
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ====== ここでデプロイスタンプを毎回書き直す（app.py の /version で表示される）======
       - name: Write deploy stamp (auto)
         run: |
-          echo "deployed_at $(date -u +'%Y-%m-%dT%H:%M:%SZ') $GITHUB_SHA" > DEPLOY_STAMP.txt
+          echo "deployed_at $(date -u +'%Y-%m-%dT%H:%M:%SZ') ${{ github.sha }}" > DEPLOY_STAMP.txt
 
-      # ④ Buildx + キャッシュ（速い）
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build and push image (with cache)
+      # ====== Docker ビルド & プッシュ（タグはコミットSHAのみ＝イミュータブル）======
+      - name: Build and push image (no cache)
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./Dockerfile
           push: true
-          tags: |
-            ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}
+          no-cache: true
 
-      # ⑤ 同一タグのまま「新デプロイを強制」→ Fargate が新イメージをpull
+      # ====== 同一タッグの再プルで ECS を強制ロールアウト ======
       - name: Force new deployment (same tag pull)
+        shell: bash
         run: |
+          set -euo pipefail
           aws ecs update-service \
-            --cluster  "${CLUSTER_ARN}" \
-            --service  "${SERVICE_ARN}" \
-            --force-new-deployment \
-            --region   "${AWS_REGION}"
-
-          # 安定化待ち（exponential backoffで10分程度）
+            --cluster "${CLUSTER_ARN}" \
+            --service "${SERVICE_ARN}" \
+            --force-new-deployment >/dev/null
           aws ecs wait services-stable \
             --cluster "${CLUSTER_ARN}" \
-            --services "${SERVICE_ARN}" \
-            --region  "${AWS_REGION}"
+            --services "${SERVICE_ARN}"
