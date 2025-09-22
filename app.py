@@ -1,79 +1,38 @@
-name: Deploy to ECS (same-tag rollout)
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse, PlainTextResponse
+import os
+from pathlib import Path
+from datetime import datetime
 
-on:
-  push:
-    branches: ["main"]
-  workflow_dispatch: {}
+app = FastAPI(title="voicebot")
 
-env:
-  AWS_REGION: ap-northeast-1
-  ACCOUNT_ID: "291234479055"
-  ECR_REPO: voicebot
-  IMAGE_TAG: v2
-  CLUSTER_ARN: arn:aws:ecs:ap-northeast-1:291234479055:cluster/voicebot-cluster
-  SERVICE_ARN: arn:aws:ecs:ap-northeast-1:291234479055:service/voicebot-cluster/svc-voicebot
+DEPLOY_STAMP_PATH = Path(__file__).parent / "DEPLOY_STAMP.txt"
 
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+def _read_deploy_stamp():
+    try:
+        txt = DEPLOY_STAMP_PATH.read_text(encoding="utf-8").strip()
+        parts = txt.split()
+        stamp = {"raw": txt, "time_utc": None, "commit_sha": None}
+        if len(parts) >= 2:
+            stamp["time_utc"] = parts[1]
+        if len(parts) >= 3:
+            stamp["commit_sha"] = parts[2]
+        return stamp
+    except FileNotFoundError:
+        return {"raw": None, "time_utc": None, "commit_sha": None}
+    except Exception as e:
+        return {"raw": f"error: {e}", "time_utc": None, "commit_sha": None}
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+@app.get("/", response_class=PlainTextResponse)
+def root():
+    return "voicebot is running"
 
-      - name: Who am I (STS)
-        run: aws sts get-caller-identity
+@app.get("/health")
+def health():
+    return {"status": "ok", "time": datetime.utcnow().isoformat() + "Z"}
 
-      - name: Ensure ECR repository exists
-        run: |
-          aws ecr describe-repositories --repository-names "${ECR_REPO}" >/dev/null 2>&1 || \
-          aws ecr create-repository --repository-name "${ECR_REPO}" >/dev/null
-
-      - name: Login to Amazon ECR
-        run: |
-          aws ecr get-login-password --region "${AWS_REGION}" \
-            | docker login --username AWS --password-stdin \
-              "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-
-      # ← ここで app.py の中身をログに出して、本当に /version が入っているか確認します
-      - name: Show app.py (first 120 lines)
-        run: |
-          echo "Branch: $GITHUB_REF  Commit: $(git rev-parse HEAD)"
-          echo "Repo files:"
-          ls -la
-          echo "----- app.py head -----"
-          sed -n '1,120p' app.py || true
-          echo "----- end app.py -----"
-
-      # デプロイスタンプを書き出し（app.py が参照します）
-      - name: Write deploy stamp (auto)
-        run: |
-          echo "deployed_at $(date -u +'%Y-%m-%dT%H:%M:%SZ') $(git rev-parse --short HEAD)" > DEPLOY_STAMP.txt
-          cat DEPLOY_STAMP.txt
-
-      - name: Build and push image (no cache)
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          no-cache: true
-          tags: ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}
-
-      - name: Force new deployment (same tag pull)
-        run: |
-          aws ecs update-service \
-            --cluster "${CLUSTER_ARN}" \
-            --service "${SERVICE_ARN}" \
-            --force-new-deployment \
-            --region "${AWS_REGION}" >/dev/null
-          aws ecs wait services-stable \
-            --cluster "${CLUSTER_ARN}" \
-            --services "${SERVICE_ARN}" \
-            --region "${AWS_REGION}"
+@app.get("/version")
+def version():
+    stamp = _read_deploy_stamp()
+    env = {"image_tag": os.getenv("IMAGE_TAG"), "aws_region": os.getenv("AWS_REGION")}
+    return JSONResponse({"app": "voicebot", "deploy_stamp": stamp, "env": env})
