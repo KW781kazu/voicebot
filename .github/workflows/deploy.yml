@@ -2,14 +2,15 @@ name: Deploy to ECS (same-tag rollout)
 
 on:
   push:
-    branches: ["main"]
-  workflow_dispatch: {}
+    branches:
+      - main
+  workflow_dispatch:
 
 env:
   AWS_REGION: ap-northeast-1
   ACCOUNT_ID: "291234479055"
   ECR_REPO: voicebot
-  IMAGE_TAG: v2
+  IMAGE_TAG: v1
   CLUSTER_ARN: arn:aws:ecs:ap-northeast-1:291234479055:cluster/voicebot-cluster
   SERVICE_ARN: arn:aws:ecs:ap-northeast-1:291234479055:service/voicebot-cluster/svc-voicebot
 
@@ -17,8 +18,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -31,47 +31,26 @@ jobs:
         run: aws sts get-caller-identity
 
       - name: Ensure ECR repository exists
-        run: |
-          aws ecr describe-repositories --repository-names "${ECR_REPO}" >/dev/null 2>&1 || \
-          aws ecr create-repository --repository-name "${ECR_REPO}" >/dev/null
+        run: aws ecr describe-repositories --repository-names ${{ env.ECR_REPO }} || aws ecr create-repository --repository-name ${{ env.ECR_REPO }}
 
       - name: Login to Amazon ECR
-        run: |
-          aws ecr get-login-password --region "${AWS_REGION}" \
-            | docker login --username AWS --password-stdin \
-              "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-
-      # ここが “Show app.py” ステップ
-      - name: Show app.py (first 120 lines)
-        run: |
-          echo "Branch: $GITHUB_REF  Commit: $(git rev-parse HEAD)"
-          ls -la
-          echo "----- app.py head -----"
-          sed -n '1,120p' app.py || true
-          echo "----- end app.py -----"
+        run: aws ecr get-login-password --region "${{ env.AWS_REGION }}" | docker login --username AWS --password-stdin "${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
 
       - name: Write deploy stamp (auto)
         run: |
-          echo "deployed_at $(date -u +'%Y-%m-%dT%H:%M:%SZ') $(git rev-parse --short HEAD)" > DEPLOY_STAMP.txt
-          cat DEPLOY_STAMP.txt
+          echo "{\"deployed_at\":\"$(date -u +'%Y-%m-%dT%H:%M:%SZ')\",\"commit\":\"${GITHUB_SHA::7}\"}" > DEPLOY_STAMP.txt
 
       - name: Build and push image (no cache)
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./Dockerfile
           push: true
-          no-cache: true
           tags: ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}
 
       - name: Force new deployment (same tag pull)
         run: |
           aws ecs update-service \
-            --cluster "${CLUSTER_ARN}" \
-            --service "${SERVICE_ARN}" \
+            --cluster "${{ env.CLUSTER_ARN }}" \
+            --service "${{ env.SERVICE_ARN }}" \
             --force-new-deployment \
-            --region "${AWS_REGION}" >/dev/null
-          aws ecs wait services-stable \
-            --cluster "${CLUSTER_ARN}" \
-            --services "${SERVICE_ARN}" \
-            --region "${AWS_REGION}"
+            --region "${{ env.AWS_REGION }}"
