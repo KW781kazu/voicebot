@@ -2,15 +2,14 @@ name: Deploy to ECS (same-tag rollout)
 
 on:
   push:
-    branches:
-      - main
-  workflow_dispatch:
+    branches: ["main"]
+  workflow_dispatch: {}
 
 env:
   AWS_REGION: ap-northeast-1
   ACCOUNT_ID: "291234479055"
   ECR_REPO: voicebot
-  IMAGE_TAG: v1
+  IMAGE_TAG: v2
   CLUSTER_ARN: arn:aws:ecs:ap-northeast-1:291234479055:cluster/voicebot-cluster
   SERVICE_ARN: arn:aws:ecs:ap-northeast-1:291234479055:service/voicebot-cluster/svc-voicebot
 
@@ -18,7 +17,8 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -32,18 +32,27 @@ jobs:
 
       - name: Ensure ECR repository exists
         run: |
-          aws ecr describe-repositories --repository-names "$ECR_REPO" || \
-          aws ecr create-repository --repository-name "$ECR_REPO"
+          aws ecr describe-repositories --repository-names "${ECR_REPO}" >/dev/null 2>&1 || \
+          aws ecr create-repository --repository-name "${ECR_REPO}" >/dev/null
 
       - name: Login to Amazon ECR
         run: |
-          aws ecr get-login-password --region "$AWS_REGION" \
+          aws ecr get-login-password --region "${AWS_REGION}" \
             | docker login --username AWS --password-stdin \
               "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
+      # ここが “Show app.py” ステップ
+      - name: Show app.py (first 120 lines)
+        run: |
+          echo "Branch: $GITHUB_REF  Commit: $(git rev-parse HEAD)"
+          ls -la
+          echo "----- app.py head -----"
+          sed -n '1,120p' app.py || true
+          echo "----- end app.py -----"
+
       - name: Write deploy stamp (auto)
         run: |
-          echo "redeploy $(date -u +%Y-%m-%dT%H:%M:%SZ) $GITHUB_SHA" > DEPLOY_STAMP.txt
+          echo "deployed_at $(date -u +'%Y-%m-%dT%H:%M:%SZ') $(git rev-parse --short HEAD)" > DEPLOY_STAMP.txt
           cat DEPLOY_STAMP.txt
 
       - name: Build and push image (no cache)
@@ -58,7 +67,11 @@ jobs:
       - name: Force new deployment (same tag pull)
         run: |
           aws ecs update-service \
-            --cluster "$CLUSTER_ARN" \
-            --service "$SERVICE_ARN" \
+            --cluster "${CLUSTER_ARN}" \
+            --service "${SERVICE_ARN}" \
             --force-new-deployment \
-            --region "$AWS_REGION"
+            --region "${AWS_REGION}" >/dev/null
+          aws ecs wait services-stable \
+            --cluster "${CLUSTER_ARN}" \
+            --services "${SERVICE_ARN}" \
+            --region "${AWS_REGION}"
