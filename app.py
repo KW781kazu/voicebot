@@ -1,5 +1,5 @@
 # app.py 〈全文〉
-# /health, /version, /twiml（固定応答）, /twiml_stream（無音→挨拶→<Connect><Stream>）, /stream（WS受信ログ）
+# /health, /version, /twiml（固定応答）, /twiml_stream（ダミー発声→挨拶→<Connect><Stream>）, /stream（WS受信ログ）
 # 起動: uvicorn app:app --host 0.0.0.0 --port 8080
 
 from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect
@@ -9,7 +9,7 @@ import json
 import traceback
 
 APP_NAME = "voicebot"
-APP_VERSION = "0.3.1"  # 頭切れ対策リリース
+APP_VERSION = "0.3.2"  # ダミー発声で頭切れ対策
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
@@ -50,16 +50,17 @@ async def twiml():
     )
     return Response(content=xml, media_type="text/xml")
 
-# ---- 無音 → 挨拶 → <Connect><Stream>（頭切れ対策）----
+# ---- ダミー発声 → 挨拶 → <Connect><Stream>（頭切れ対策の本命）----
 # TwiML App / 電話番号の Webhook は https://voice.frontglass.net/twiml_stream
 @app.get("/twiml_stream")
 @app.post("/twiml_stream")
 async def twiml_stream():
     ws_url = "wss://voice.frontglass.net/stream"
+    # 先頭にごく短い発声「テスト」を挟んで TTS/送出バッファを起こす
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<Response>'
-        '<Pause length="1"/>'  # ★頭切れ対策：最初に1秒無音
+        '<Say language="ja-JP">テスト</Say>'
         '<Say language="ja-JP">接続テストを開始します。</Say>'
         f'<Connect><Stream url="{ws_url}"/></Connect>'
         '</Response>'
