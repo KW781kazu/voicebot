@@ -4,34 +4,36 @@ name: Deploy to ECS (immutable tag + smoke test)
 on:
   workflow_dispatch:
   push:
-    branches: [ "main" ]  # 任意。手動実行だけにしたい場合はこのブロックを消してください。
+    branches: [ "main" ]
 
 env:
   AWS_REGION: ap-northeast-1
   AWS_ACCOUNT_ID: "291234479055"
   ECR_REPO: "voicebot"
   ECS_CLUSTER: "voicebot-cluster"
-  ECS_SERVICE: "svc-voicebot"          # ← あなたの実名に合わせてあります
-  TASK_FAMILY: "voicebot-task"         # 既存のタスク定義ファミリー
-  CONTAINER_NAME: "voicebot"           # タスク内のコンテナ名（異なる場合は変更）
+  ECS_SERVICE: "svc-voicebot"          # ← 実名（確認済み）
+  TASK_FAMILY: "voicebot-task"         # 既存ファミリー
+  CONTAINER_NAME: "voicebot"           # タスク内コンテナ名（異なる場合は変更）
   PUBLIC_BASE_URL: "https://voice.frontglass.net"
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
       contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials (OIDC)
+      # === ここをアクセスキー方式に変更 ===
+      - name: Configure AWS credentials (Access Keys)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
-          # 既に動いているワークフローがあるはずなので、同じロールを使う場合は下行を設定してください
-          # role-to-assume: arn:aws:iam::291234479055:role/<your-github-actions-role>
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          # 一時クレデンシャルの場合のみ有効化
+          # aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
 
       - name: Login to ECR
         id: ecr
@@ -82,7 +84,7 @@ jobs:
             --cluster "${{ env.ECS_CLUSTER }}" \
             --services "${{ env.ECS_SERVICE }}"
 
-      # ---- ここがスモークテスト：/twiml が API に載っているかを検査 ----
+      # ---- Smoke tests ----
       - name: Smoke test - /twiml appears in OpenAPI
         run: |
           set -e
