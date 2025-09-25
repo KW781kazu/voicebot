@@ -1,6 +1,6 @@
 # app.py 〈全文〉
-# FastAPI アプリ本体。/health, /version, /twiml（固定応答）, /twiml_stream（<Connect><Stream>）, /stream（WebSocket受信）を提供。
-# 起動（参考）：uvicorn app:app --host 0.0.0.0 --port 8080
+# /health, /version, /twiml（固定応答）, /twiml_stream（挨拶→<Connect><Stream>）, /stream（WS受信ログ）
+# 起動: uvicorn app:app --host 0.0.0.0 --port 8080
 
 from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect
 from datetime import datetime, timezone
@@ -9,11 +9,11 @@ import json
 import traceback
 
 APP_NAME = "voicebot"
-APP_VERSION = "0.2.0"  # ← 版上げ
+APP_VERSION = "0.3.0"  # 版上げ
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
-# -------- 基本ルート --------
+# ---- 基本 ----
 @app.get("/")
 async def root_get():
     return {"message": "ok", "app": APP_NAME, "version": APP_VERSION}
@@ -36,7 +36,7 @@ async def version_get():
         },
     }
 
-# -------- 固定TwiML（このまま残す）--------
+# ---- 固定TwiML（確認用に残す）----
 @app.get("/twiml")
 @app.post("/twiml")
 async def twiml():
@@ -50,36 +50,32 @@ async def twiml():
     )
     return Response(content=xml, media_type="text/xml")
 
-# -------- <Connect><Stream> 用 TwiML --------
-# Twilio の Webhook を https://voice.frontglass.net/twiml_stream に向けると
-# 通話中の音声が WebSocket(wss) で /stream に送られてきます（まずは受信カウントのみ）。
+# ---- 挨拶 → <Connect><Stream> ----
+# TwiML App / 電話番号の Webhook を https://voice.frontglass.net/twiml_stream に設定
 @app.get("/twiml_stream")
 @app.post("/twiml_stream")
 async def twiml_stream():
-    # 重要: wss のURLは「あなたのHTTPSドメイン + /stream」
     ws_url = "wss://voice.frontglass.net/stream"
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<Response>'
-        f'  <Connect><Stream url="{ws_url}"/></Connect>'
+        '<Say language="ja-JP">接続テストを開始します。</Say>'
+        f'<Connect><Stream url="{ws_url}"/></Connect>'
         '</Response>'
     )
     return Response(content=xml, media_type="text/xml")
 
-# -------- WebSocket 受信口 (/stream) --------
-# 受け取ったTwilio Media Streamsのイベント(JSON)を数えるだけ（処理はしない）。
+# ---- WebSocket 受信（Twilio Media Streams）----
 @app.websocket("/stream")
 async def stream_ws(ws: WebSocket):
     await ws.accept()
     msg_count = 0
     start_ts = datetime.now(timezone.utc).isoformat()
     print(f"[WS] OPEN at {start_ts}", flush=True)
-
     try:
         while True:
-            data = await ws.receive_text()  # TwilioはテキストJSONで送ってくる
+            data = await ws.receive_text()  # Twilio はテキストJSON
             msg_count += 1
-            # 最初の数件だけ種類をログに出す（多すぎるログを防ぐ）
             if msg_count <= 5:
                 try:
                     evt = json.loads(data)
@@ -87,7 +83,6 @@ async def stream_ws(ws: WebSocket):
                     print(f"[WS] #{msg_count} event={event_type}", flush=True)
                 except Exception:
                     print(f"[WS] #{msg_count} (non-JSON?)", flush=True)
-            # 100件ごとに進捗ログ
             if msg_count % 100 == 0:
                 print(f"[WS] received {msg_count} messages...", flush=True)
     except WebSocketDisconnect:
@@ -95,7 +90,6 @@ async def stream_ws(ws: WebSocket):
         print(f"[WS] CLOSE at {end_ts}, total={msg_count}", flush=True)
     except Exception:
         end_ts = datetime.now(timezone.utc).isoformat()
-        print(f"[WS] ERROR at {end_ts}, total={msg_count}")
+        print(f"[WS] ERROR at {end_ts}, total={msg_count}", flush=True)
         traceback.print_exc()
-        # Twilio側へは正常クローズで返す
         await ws.close()
