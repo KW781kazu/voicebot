@@ -1,23 +1,26 @@
 # app.py 〈全文〉
+# 機能:
 # - /health, /version
 # - /twiml（固定テスト応答）
 # - /twiml_stream（ダミー発声→挨拶→<Connect><Stream>）
-# - /stream（Twilio Media Streams 受信 + 自動キャリブレーションVAD + ログ）
+# - /stream（Twilio Media Streams 受信 + 自動キャリブレーションVAD + 最初の発話で0.5秒ビープ返信）
 # 起動例: uvicorn app:app --host 0.0.0.0 --port 8080
 
 from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect
 from datetime import datetime, timezone
-import os, json, traceback, base64, audioop
+import os, json, traceback, base64, audioop, math, time
 
 APP_NAME = "voicebot"
-APP_VERSION = "0.4.1"  # VAD: 自動キャリブレーション + RMSログ
+APP_VERSION = "0.5.0"  # 送信方向（サーバ→Twilio）確認: 0.5秒ビープ返信
 
-# ---- Audio/VAD 設定 ----
-SAMPLE_RATE = 8000          # Twilio Media Streams は PCMU 8kHz
-FRAME_MS = 20               # 1フレーム=20ms（Twilio既定）
-CALIB_FRAMES = 50           # 最初の ~1.0秒 を無音キャリブ用に使う
-RMS_MULTIPLIER = float(os.getenv("RMS_MULTIPLIER", "3.0"))  # しきい値=無音平均*係数
-RMS_MIN = int(os.getenv("RMS_MIN", "120"))                  # 最低しきい値
+# ---- Audio / Stream 設定 ----
+SAMPLE_RATE = 8000          # Twilio Media Streams は 8kHz
+FRAME_MS = 20               # 1フレーム=20ms
+SAMPLES_PER_FRAME = SAMPLE_RATE * FRAME_MS // 1000  # 160 samples
+CALIB_FRAMES = 50           # ~1.0秒 を無音キャリブに使用
+RMS_MULTIPLIER = float(os.getenv("RMS_MULTIPLIER", "3.0"))
+RMS_MIN = int(os.getenv("RMS_MIN", "120"))
+HANGOVER_FRAMES = 8         # 無音継続で END
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
@@ -73,6 +76,31 @@ async def twiml_stream():
     )
     return Response(content=xml, media_type="text/xml")
 
+# ========== ユーティリティ：ビープ波形を μ-law で20msフレーム列にする ==========
+def gen_beep_ulaw_frames(freq_hz=440.0, duration_sec=0.5, volume=0.4):
+    """
+    440Hzのサイン波を duration_sec だけ生成し、20msごとの μ-law フレーム(base64文字列)のリストを返す。
+    """
+    total_samples = int(SAMPLE_RATE * duration_sec)
+    frames = []
+    t = 0.0
+    dt = 1.0 / SAMPLE_RATE
+    # 16bit PCM（-32768..32767）で生成 → μ-law へ
+    pcm = bytearray()
+    for n in range(total_samples):
+        s = int(32767 * volume * math.sin(2 * math.pi * freq_hz * t))
+        pcm += s.to_bytes(2, byteorder="little", signed=True)
+        t += dt
+    # 20msごとに分割
+    for i in range(0, len(pcm), SAMPLES_PER_FRAME * 2):
+        chunk = pcm[i:i + SAMPLES_PER_FRAME * 2]
+        # 足りない末尾はゼロでパディング
+        if len(chunk) < SAMPLES_PER_FRAME * 2:
+            chunk += b"\x00" * (SAMPLES_PER_FRAME * 2 - len(chunk))
+        ulaw = audioop.lin2ulaw(bytes(chunk), 2)
+        frames.append(base64.b64encode(ulaw).decode("ascii"))
+    return frames
+
 # ========== WebSocket（Twilio Media Streams）==========
 @app.websocket("/stream")
 async def stream_ws(ws: WebSocket):
@@ -84,12 +112,14 @@ async def stream_ws(ws: WebSocket):
     msg_count = 0
     speaking = False
     hangover = 0
-    HANGOVER_FRAMES = 8  # 無音が続いたら END
 
-    # キャリブ用
+    # キャリブ
     calib_rms_sum = 0
     calib_rms_cnt = 0
     threshold = None
+
+    # 一度だけビープを返すフラグ
+    beep_sent = False
 
     try:
         while True:
@@ -125,7 +155,7 @@ async def stream_ws(ws: WebSocket):
             try:
                 ulaw = base64.b64decode(payload_b64)
                 lin16 = audioop.ulaw2lin(ulaw, 2)
-                rms = audioop.rms(lin16, 2)  # 典型: 無音100前後〜発話時数百〜数千
+                rms = audioop.rms(lin16, 2)
             except Exception:
                 continue
 
@@ -138,14 +168,8 @@ async def stream_ws(ws: WebSocket):
                     noise_avg = (calib_rms_sum / max(1, calib_rms_cnt))
                     threshold = max(int(noise_avg * RMS_MULTIPLIER), RMS_MIN)
                     print(f"[VAD] calibrated: noise_avg={int(noise_avg)} threshold={threshold}", flush=True)
-                # 初期200フレームはRMSを毎回出して観測
-            else:
-                if msg_count <= 200:
-                    print(f"[RMS] {rms}", flush=True)
-                elif msg_count % 200 == 0:
-                    print(f"[RMS] {rms}", flush=True)
+                continue  # 閾値が決まるまではVADしない
 
-            # ---- しきい値がまだなら何もしない ----
             if threshold is None:
                 continue
 
@@ -156,6 +180,22 @@ async def stream_ws(ws: WebSocket):
                     speaking = True
                     ts = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
                     print(f"[VAD] START rms={rms} thr={threshold} @{ts}", flush=True)
+
+                    # ★ 初回の発話で0.5秒ビープを一度だけ返す（双方向確認）
+                    if not beep_sent:
+                        try:
+                            frames = gen_beep_ulaw_frames(freq_hz=440.0, duration_sec=0.5, volume=0.4)
+                            for b64 in frames:
+                                await ws.send_text(json.dumps({"event": "media", "media": {"payload": b64}}))
+                                # Twilioは20msフレーム想定：少し待って送出をエミュレート
+                                await asyncio_sleep_ms(FRAME_MS)
+                            # マークを送っておく（任意）
+                            await ws.send_text(json.dumps({"event": "mark", "mark": {"name": "beep_end"}}))
+                            beep_sent = True
+                            print("[TX] sent 0.5s beep to caller", flush=True)
+                        except Exception:
+                            traceback.print_exc()
+
             else:
                 if speaking:
                     if hangover > 0:
@@ -180,3 +220,8 @@ async def stream_ws(ws: WebSocket):
             await ws.close()
         except Exception:
             pass
+
+# ---- 非同期スリープ（ms）ユーティリティ ----
+import asyncio
+async def asyncio_sleep_ms(ms: int):
+    await asyncio.sleep(ms / 1000.0)
