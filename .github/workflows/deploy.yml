@@ -1,4 +1,4 @@
-name: Deploy to ECS (image-only rollout)
+name: Deploy to ECS (image-only rollout, keys)
 
 on:
   workflow_dispatch:
@@ -11,10 +11,8 @@ on:
       - ".github/workflows/deploy.yml"
 
 permissions:
-  id-token: write   # for OIDC
   contents: read
 
-# ここでは “定数” だけ定義。相互参照はしない
 env:
   AWS_REGION: ap-northeast-1
   AWS_ACCOUNT_ID: "291234479055"
@@ -30,13 +28,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # --- AWS 認証（OIDC） ---
-      - name: Configure AWS credentials (OIDC)
+      # --- AWS 認証（アクセスキー） ---
+      - name: Configure AWS credentials (keys)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: arn:aws:iam::291234479055:role/GitHubActionsDeployRole
-          role-session-name: gh-deploy-voicebot
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
       # --- ECR ログイン & Build/Push ---
       - name: Login to ECR
@@ -114,7 +112,7 @@ jobs:
             --services "${SERVICE}" \
             --region "${AWS_REGION}"
 
-      # --- 軽いスモークテスト（失敗で赤） ---
+      # --- 簡易スモークテスト ---
       - name: Smoke test - /openapi.json
         run: |
           set -e
