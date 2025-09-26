@@ -1,9 +1,10 @@
-# app.py 〈全文〉
-# - Twilio <Connect><Stream> → WebSocket /stream で音声受信
-# - Amazon Transcribe Streaming でリアルタイムSTT
-# - FINAL を S3 に保存
-# - 最初の FINAL で自動応答（<Say>）→ すぐ <Connect><Stream> で再接続
-#   * TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN が未設定なら応答はスキップ
+# app.py 〈全文〉 v0.8.1
+# - STT + S3保存はそのまま
+# - 返答（Live Call Control）で詳細ログを追加
+#   * 起動時: Twilio 環境変数があるか
+#   * [WS] start で受けた payload をそのまま1行で出力
+#   * 返信直前/直後/失敗時の例外内容を出力
+
 from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect
 from datetime import datetime, timezone
 import os, json, traceback, base64, audioop, asyncio, uuid
@@ -17,7 +18,7 @@ import boto3
 from twilio.rest import Client as TwilioClient
 
 APP_NAME = "voicebot"
-APP_VERSION = "0.8.0"  # 1-turn auto-reply
+APP_VERSION = "0.8.1"  # debug logs for LCC
 
 SAMPLE_RATE = 8000
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-1")
@@ -25,7 +26,6 @@ TRANSCRIBE_LANGUAGE = os.getenv("TRANSCRIBE_LANGUAGE", "ja-JP")
 TRANSCRIBE_VOCAB = os.getenv("TRANSCRIBE_VOCAB", "")
 S3_BUCKET = os.getenv("TRANSCRIPT_BUCKET", f"voicebot-transcripts-291234479055-{AWS_REGION}")
 
-# Twilio 資格情報（未設定なら自動応答はスキップ）
 TW_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TW_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 
@@ -40,7 +40,9 @@ def add_recent(call_id: str, text: str, started_at: str, finished_at: str):
         RECENTS.pop()
 
 @app.get("/")
-async def root_get(): return {"message":"ok","app":APP_NAME,"version":APP_VERSION}
+async def root_get(): 
+    return {"message":"ok","app":APP_NAME,"version":APP_VERSION,
+            "twilio_env":{"sid": bool(TW_SID), "token": bool(TW_TOKEN)}}
 
 @app.get("/health")
 async def health_get(): return {"status":"ok"}
@@ -77,19 +79,19 @@ class MyTranscriptHandler(TranscriptResultStreamHandler):
         super().__init__(output_stream)
         self.on_partial = on_partial
         self.on_final = on_final
-
     async def handle_transcript_event(self, ev: TranscriptEvent):
         for res in ev.transcript.results:
-            if not res.alternatives: continue
-            text = res.alternatives[0].transcript or ""
-            if not text: continue
+            if not res.alternatives: 
+                continue
+            text = (res.alternatives[0].transcript or "").strip()
+            if not text: 
+                continue
             if res.is_partial:
                 self.on_partial(text)
             else:
                 self.on_final(text)
 
 def build_reply_twiml(reply_text: str, ws_url: str) -> str:
-    # 応答 → すぐ再接続（同じWSに戻る）
     return (f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say language="ja-JP">{reply_text}</Say>
@@ -103,10 +105,12 @@ async def stream_ws(ws: WebSocket):
     started_at = datetime.now(timezone.utc).isoformat()
     print(f"[WS] OPEN call={call_id} at {started_at}", flush=True)
 
+    print(f"[BOOT] TW_SID={bool(TW_SID)} TW_TOKEN={bool(TW_TOKEN)}", flush=True)
+
     s3 = boto3.client("s3", region_name=AWS_REGION)
     finals: List[str] = []
     call_sid: Optional[str] = None
-    replied_once = False  # 最初のFINALだけ応答
+    replied_once = False
 
     client = TranscribeStreamingClient(region=AWS_REGION)
     stream = await client.start_stream_transcription(
@@ -121,22 +125,25 @@ async def stream_ws(ws: WebSocket):
 
     async def do_reply_if_ready(text: str):
         nonlocal replied_once
-        if replied_once or not TW_SID or not TW_TOKEN or not call_sid:
+        if replied_once:
+            return
+        if not TW_SID or not TW_TOKEN:
+            print("[LCC] skipped: TWILIO env not set", flush=True)
+            return
+        if not call_sid:
+            print("[LCC] skipped: callSid not yet known", flush=True)
             return
         try:
             tw = TwilioClient(TW_SID, TW_TOKEN)
             ws_url = "wss://voice.frontglass.net/stream"
-            reply = f"こちらはボイスボットです。ご用件をどうぞ。"
-            # 例として簡単に：最初の発話を短く復唱
-            if len(text) <= 30:
-                reply = f"こちらはボイスボットです。今、「{text}」と聞こえました。ご用件をどうぞ。"
+            reply = f"こちらはボイスボットです。今、「{text[:30]}」と聞こえました。ご用件をどうぞ。"
             twml = build_reply_twiml(reply, ws_url)
-            # ライブ通話を即時リダイレクト
+            print(f"[LCC] try redirect callSid={call_sid} text='{text}'", flush=True)
             tw.calls(call_sid).update(twiml=twml)
             replied_once = True
             print(f"[LCC] replied via TwiML redirect (callSid={call_sid})", flush=True)
-        except Exception:
-            print("[LCC] reply failed", flush=True)
+        except Exception as e:
+            print(f"[LCC] reply failed: {repr(e)}", flush=True)
             traceback.print_exc()
 
     async def on_final_async(t: str):
@@ -145,6 +152,7 @@ async def stream_ws(ws: WebSocket):
         await do_reply_if_ready(t)
 
     async def pump_audio():
+        nonlocal call_sid
         try:
             while True:
                 t = await ws.receive_text()
@@ -157,11 +165,13 @@ async def stream_ws(ws: WebSocket):
                     if et in ("connected","start","stop","mark"):
                         print(f"[WS] {et}", flush=True)
                     if et == "start":
-                        # start イベントから callSid を取る
+                        # 受け取った start payload をそのまま出力（1行）
                         try:
-                            call_info = e.get("start", {})
-                            nonlocal call_sid
-                            call_sid = call_info.get("callSid")
+                            print(f"[WS] start payload: {json.dumps(e.get('start',{}), ensure_ascii=False)}", flush=True)
+                        except Exception:
+                            pass
+                        try:
+                            call_sid = e.get("start", {}).get("callSid")
                             if call_sid:
                                 print(f"[WS] callSid={call_sid}", flush=True)
                         except Exception:
@@ -170,7 +180,8 @@ async def stream_ws(ws: WebSocket):
                         break
                     continue
                 b64 = e.get("media",{}).get("payload")
-                if not b64: continue
+                if not b64: 
+                    continue
                 try:
                     ulaw = base64.b64decode(b64)
                     pcm16 = audioop.ulaw2lin(ulaw, 2)
@@ -182,8 +193,10 @@ async def stream_ws(ws: WebSocket):
         except Exception:
             traceback.print_exc()
         finally:
-            try: await stream.input_stream.end_stream()
-            except Exception: pass
+            try: 
+                await stream.input_stream.end_stream()
+            except Exception: 
+                pass
 
     async def read_transcripts():
         try:
@@ -205,16 +218,12 @@ async def stream_ws(ws: WebSocket):
         finished_at = datetime.now(timezone.utc).isoformat()
         text_joined = "".join(finals)
         add_recent(call_id, text_joined, started_at, finished_at)
-        # S3 保存
         try:
             day = started_at.split("T")[0]
             key = f"calls/{day}/call-{call_id}.json"
             body = json.dumps({
-                "id": call_id,
-                "started_at": started_at,
-                "finished_at": finished_at,
-                "language": TRANSCRIBE_LANGUAGE,
-                "text": text_joined
+                "id": call_id, "started_at": started_at, "finished_at": finished_at,
+                "language": TRANSCRIBE_LANGUAGE, "text": text_joined
             }, ensure_ascii=False).encode("utf-8")
             s3.put_object(Bucket=S3_BUCKET, Key=key, Body=body, ContentType="application/json")
             print(f"[S3] put s3://{S3_BUCKET}/{key} bytes={len(body)}", flush=True)
@@ -223,9 +232,7 @@ async def stream_ws(ws: WebSocket):
             traceback.print_exc()
 
         print(f"[WS] CLOSE call={call_id} text='{text_joined}'", flush=True)
-        try: await ws.close()
-        except Exception: pass
-
-@app.get("/transcripts")
-async def list_transcripts(limit: int = 10):
-    return {"items": RECENTS[: max(1, min(limit, MAX_RECENTS))]}
+        try: 
+            await ws.close()
+        except Exception: 
+            pass
