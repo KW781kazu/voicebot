@@ -19,6 +19,7 @@ env:
   ECR_REPO: voicebot
   CLUSTER: voicebot-cluster
   SERVICE: svc-voicebot
+  CONTAINER_NAME: voicebot   # ← タスク定義のコンテナ名。違う場合はここを修正。
 
 jobs:
   deploy:
@@ -28,7 +29,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # --- AWS 認証（アクセスキー） ---
       - name: Configure AWS credentials (keys)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -36,7 +36,6 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
-      # --- ECR ログイン & Build/Push ---
       - name: Login to ECR
         run: |
           aws ecr get-login-password --region "${AWS_REGION}" \
@@ -57,7 +56,6 @@ jobs:
           echo "ECR_IMAGE_URI=${ECR_IMAGE_URI}" >> $GITHUB_ENV
           echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_ENV
 
-      # --- 既存タスク定義を取得して image だけ差し替え ---
       - name: Get current task definition ARN
         id: curtd
         run: |
@@ -74,21 +72,30 @@ jobs:
             --task-definition "${{ steps.curtd.outputs.arn }}" \
             --region "${AWS_REGION}" \
             --query 'taskDefinition' --output json > td.json
+          echo "Current containers:"
+          jq -r '.containerDefinitions[] | [.name,.image] | @tsv' td.json
 
       - name: Install jq (if missing)
         run: |
           command -v jq >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y jq; }
 
+      # 画像だけ安全に差し替え（名前一致で更新。1個しか無い場合はその1個を更新）
       - name: Replace container image only (preserve secrets/env)
         run: |
           set -e
           IMAGE="${ECR_IMAGE_URI}:${IMAGE_TAG}"
-          jq '
+          NAME="${CONTAINER_NAME}"
+          jq --arg IMG "$IMAGE" --arg NAME "$NAME" '
             del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
                 .compatibilities, .registeredAt, .registeredBy)
-            | .containerDefinitions[0].image = env.IMAGE
+            | .containerDefinitions =
+                (if (.containerDefinitions | length) == 1
+                 then [ (.containerDefinitions[0] * {image:$IMG}) ]
+                 else (.containerDefinitions | map( if .name==$NAME then .image=$IMG else . end ))
+                 end)
           ' td.json > td-new.json
-          echo "New image: ${IMAGE}"
+          echo "Prepared task definition (name,image):"
+          jq -r '.containerDefinitions[] | [.name,.image] | @tsv' td-new.json
 
       - name: Register new task definition
         id: reg
@@ -112,7 +119,6 @@ jobs:
             --services "${SERVICE}" \
             --region "${AWS_REGION}"
 
-      # --- 簡易スモークテスト ---
       - name: Smoke test - /openapi.json
         run: |
           set -e
