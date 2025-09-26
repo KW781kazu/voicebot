@@ -11,27 +11,24 @@ on:
       - ".github/workflows/deploy.yml"
 
 permissions:
-  id-token: write    # OIDC 用（推奨）
+  id-token: write   # for OIDC
   contents: read
 
+# ここでは “定数” だけ定義。相互参照はしない
 env:
   AWS_REGION: ap-northeast-1
   AWS_ACCOUNT_ID: "291234479055"
   ECR_REPO: voicebot
   CLUSTER: voicebot-cluster
   SERVICE: svc-voicebot
-  # コンテナは 1 つ想定（containerDefinitions[0] の image だけ置換）
-  IMAGE_TAG: ${{ github.sha }}
-  ECR_IMAGE_URI: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     steps:
       - name: Checkout
-      - uses: actions/checkout@v4
+        uses: actions/checkout@v4
 
       # --- AWS 認証（OIDC） ---
       - name: Configure AWS credentials (OIDC)
@@ -54,8 +51,13 @@ jobs:
 
       - name: Build & Push (tag = commit SHA)
         run: |
+          set -e
+          IMAGE_TAG="${GITHUB_SHA}"
+          ECR_IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
           docker build -t "${ECR_IMAGE_URI}:${IMAGE_TAG}" .
           docker push "${ECR_IMAGE_URI}:${IMAGE_TAG}"
+          echo "ECR_IMAGE_URI=${ECR_IMAGE_URI}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_ENV
 
       # --- 既存タスク定義を取得して image だけ差し替え ---
       - name: Get current task definition ARN
@@ -74,22 +76,21 @@ jobs:
             --task-definition "${{ steps.curtd.outputs.arn }}" \
             --region "${AWS_REGION}" \
             --query 'taskDefinition' --output json > td.json
-          cat td.json | jq 'keys'  # debug
 
       - name: Install jq (if missing)
         run: |
-          command -v jq >/dev/null 2>&1 || sudo apt-get update && sudo apt-get install -y jq
+          command -v jq >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y jq; }
 
       - name: Replace container image only (preserve secrets/env)
         run: |
+          set -e
           IMAGE="${ECR_IMAGE_URI}:${IMAGE_TAG}"
-          cat td.json | jq '
+          jq '
             del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
                 .compatibilities, .registeredAt, .registeredBy)
             | .containerDefinitions[0].image = env.IMAGE
-          ' > td-new.json
-          echo "== diff preview =="
-          jq -r '.containerDefinitions[0].image' td.json td-new.json
+          ' td.json > td-new.json
+          echo "New image: ${IMAGE}"
 
       - name: Register new task definition
         id: reg
@@ -113,7 +114,7 @@ jobs:
             --services "${SERVICE}" \
             --region "${AWS_REGION}"
 
-      # --- 軽いスモークテスト（失敗でワークフローを赤に） ---
+      # --- 軽いスモークテスト（失敗で赤） ---
       - name: Smoke test - /openapi.json
         run: |
           set -e
