@@ -1,23 +1,27 @@
 # app.py 〈全文〉
 # 機能:
 # - /health, /version
-# - /twiml（固定テスト応答）
+# - /twiml（固定応答）
 # - /twiml_stream（ダミー発声→挨拶→<Connect><Stream>）
-# - /stream（Twilio Media Streams 受信 → Amazon Transcribe Streaming でリアルタイムSTT）
+# - /stream（Twilio Media Streams → Amazon Transcribe Streaming）
+#   * 通話ごとに FINAL テキストを連結して保存
+# - /transcripts（直近の通話テキストを取得）
+#
 # 起動例: uvicorn app:app --host 0.0.0.0 --port 8080
 
 from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect
 from datetime import datetime, timezone
 import os, json, traceback, base64, audioop, asyncio, uuid
+from typing import Dict, List
 
 # === Transcribe Streaming SDK ===
-# pip install amazon-transcribe
+# pip install amazon-transcribe==0.6.2
 from amazon_transcribe.client import TranscribeStreamingClient
 from amazon_transcribe.handlers import TranscriptResultStreamHandler
 from amazon_transcribe.model import TranscriptEvent
 
 APP_NAME = "voicebot"
-APP_VERSION = "0.6.0"  # STT(Transcribe) 対応
+APP_VERSION = "0.6.1"  # transcripts API 追加
 
 # ---- Audio / Stream 設定 ----
 SAMPLE_RATE = 8000          # Twilio Media Streams は 8kHz
@@ -27,6 +31,20 @@ TRANSCRIBE_LANGUAGE = os.getenv("TRANSCRIBE_LANGUAGE", "ja-JP")  # 例: ja-JP
 TRANSCRIBE_VOCAB = os.getenv("TRANSCRIBE_VOCAB", "")             # 任意: カスタム語彙名
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
+
+# ====== 直近の通話テキストを保持（メモリ、最大50件） ======
+RECENTS: List[Dict] = []  # [{id, started_at, finished_at, text}]
+MAX_RECENTS = 50
+
+def add_recent(call_id: str, text: str, started_at: str, finished_at: str):
+    RECENTS.insert(0, {
+        "id": call_id,
+        "text": text,
+        "started_at": started_at,
+        "finished_at": finished_at,
+    })
+    if len(RECENTS) > MAX_RECENTS:
+        RECENTS.pop()
 
 # ========== 基本ルート ==========
 @app.get("/")
@@ -44,11 +62,7 @@ async def version_get():
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     return {
         "app": APP_NAME,
-        "deploy_stamp": {
-            "raw": deploy_stamp_raw,
-            "time_utc": now_utc,
-            "commit_sha": commit_sha,
-        },
+        "deploy_stamp": {"raw": deploy_stamp_raw, "time_utc": now_utc, "commit_sha": commit_sha},
     }
 
 # ========== 固定TwiML（動作確認用） ==========
@@ -82,6 +96,10 @@ async def twiml_stream():
 
 # ========== Transcribe ハンドラ ==========
 class MyTranscriptHandler(TranscriptResultStreamHandler):
+    def __init__(self, output_stream, on_final):
+        super().__init__(output_stream)
+        self.on_final = on_final  # callback(str)
+
     async def handle_transcript_event(self, transcript_event: TranscriptEvent):
         results = transcript_event.transcript.results
         for res in results:
@@ -94,14 +112,19 @@ class MyTranscriptHandler(TranscriptResultStreamHandler):
                 print(f"[STT] PARTIAL: {text}", flush=True)
             else:
                 print(f"[STT] FINAL  : {text}", flush=True)
+                # FINAL を連結保存（呼び出し元のバッファに反映）
+                self.on_final(text)
 
 # ========== WebSocket（Twilio Media Streams → Transcribe）==========
 @app.websocket("/stream")
 async def stream_ws(ws: WebSocket):
     await ws.accept()
     call_id = str(uuid.uuid4())[:8]
-    start_ts = datetime.now(timezone.utc).isoformat()
-    print(f"[WS] OPEN call={call_id} at {start_ts}", flush=True)
+    started_at = datetime.now(timezone.utc).isoformat()
+    print(f"[WS] OPEN call={call_id} at {started_at}", flush=True)
+
+    # 通話テキストの蓄積バッファ
+    final_buffer: List[str] = []
 
     # Transcribe クライアントと双方向ストリームを準備
     client = TranscribeStreamingClient(region=AWS_REGION)
@@ -122,7 +145,6 @@ async def stream_ws(ws: WebSocket):
                 except Exception:
                     continue
                 if evt.get("event") != "media":
-                    # 進行状況の軽ログ
                     et = evt.get("event")
                     if et in ("connected", "start", "stop", "mark"):
                         print(f"[WS] {et}", flush=True)
@@ -135,8 +157,7 @@ async def stream_ws(ws: WebSocket):
                     continue
                 try:
                     ulaw = base64.b64decode(payload_b64)
-                    # μ-law(8kHz) → 16bit PCM へ
-                    pcm16 = audioop.ulaw2lin(ulaw, 2)
+                    pcm16 = audioop.ulaw2lin(ulaw, 2)  # μ-law(8kHz) → 16bit PCM
                 except Exception:
                     continue
 
@@ -146,7 +167,6 @@ async def stream_ws(ws: WebSocket):
         except Exception:
             traceback.print_exc()
         finally:
-            # 音声入力の終了をTranscribeに通知
             try:
                 await stream.input_stream.end_stream()
             except Exception:
@@ -155,7 +175,7 @@ async def stream_ws(ws: WebSocket):
     # Transcribe からのテキスト結果を読むタスク
     async def read_transcripts():
         try:
-            handler = MyTranscriptHandler(stream.output_stream)
+            handler = MyTranscriptHandler(stream.output_stream, on_final=lambda t: final_buffer.append(t))
             await handler.handle_events()
         except Exception:
             traceback.print_exc()
@@ -171,9 +191,16 @@ async def stream_ws(ws: WebSocket):
     except Exception:
         traceback.print_exc()
     finally:
-        end_ts = datetime.now(timezone.utc).isoformat()
-        print(f"[WS] CLOSE call={call_id} at {end_ts}", flush=True)
+        finished_at = datetime.now(timezone.utc).isoformat()
+        text_joined = "".join(final_buffer)
+        add_recent(call_id, text_joined, started_at, finished_at)
+        print(f"[WS] CLOSE call={call_id} at {finished_at} text='{text_joined}'", flush=True)
         try:
             await ws.close()
         except Exception:
             pass
+
+# ========== 直近の文字起こし取得 ==========
+@app.get("/transcripts")
+async def list_transcripts(limit: int = 10):
+    return {"items": RECENTS[: max(1, min(limit, MAX_RECENTS))]}
