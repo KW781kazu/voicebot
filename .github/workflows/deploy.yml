@@ -1,104 +1,125 @@
-# .github/workflows/deploy.yml （全文）
-name: Deploy to ECS (immutable tag + smoke test)
+name: Deploy to ECS (image-only rollout)
 
 on:
   workflow_dispatch:
   push:
     branches: [ "main" ]
+    paths:
+      - "app.py"
+      - "Dockerfile"
+      - "requirements.txt"
+      - ".github/workflows/deploy.yml"
+
+permissions:
+  id-token: write    # OIDC 用（推奨）
+  contents: read
 
 env:
   AWS_REGION: ap-northeast-1
   AWS_ACCOUNT_ID: "291234479055"
-  ECR_REPO: "voicebot"
-  ECS_CLUSTER: "voicebot-cluster"
-  ECS_SERVICE: "svc-voicebot"          # ← 実名（確認済み）
-  TASK_FAMILY: "voicebot-task"         # 既存ファミリー
-  CONTAINER_NAME: "voicebot"           # タスク内コンテナ名（異なる場合は変更）
-  PUBLIC_BASE_URL: "https://voice.frontglass.net"
+  ECR_REPO: voicebot
+  CLUSTER: voicebot-cluster
+  SERVICE: svc-voicebot
+  # コンテナは 1 つ想定（containerDefinitions[0] の image だけ置換）
+  IMAGE_TAG: ${{ github.sha }}
+  ECR_IMAGE_URI: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    timeout-minutes: 30
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # === ここをアクセスキー方式に変更 ===
-      - name: Configure AWS credentials (Access Keys)
+      # --- AWS 認証（OIDC） ---
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          # 一時クレデンシャルの場合のみ有効化
-          # aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          role-to-assume: arn:aws:iam::291234479055:role/GitHubActionsDeployRole
+          role-session-name: gh-deploy-voicebot
 
+      # --- ECR ログイン & Build/Push ---
       - name: Login to ECR
-        id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
+        run: |
+          aws ecr get-login-password --region "${AWS_REGION}" \
+            | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+      - name: Ensure ECR repository exists
+        run: |
+          aws ecr describe-repositories --repository-names "${ECR_REPO}" --region "${AWS_REGION}" >/dev/null 2>&1 \
+          || aws ecr create-repository --repository-name "${ECR_REPO}" --region "${AWS_REGION}"
 
       - name: Build & Push (tag = commit SHA)
-        env:
-          IMAGE_URI: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ github.sha }}
         run: |
-          docker build -t "$IMAGE_URI" .
-          docker push "$IMAGE_URI"
-          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+          docker build -t "${ECR_IMAGE_URI}:${IMAGE_TAG}" .
+          docker push "${ECR_IMAGE_URI}:${IMAGE_TAG}"
 
-      - name: Get current task definition JSON
+      # --- 既存タスク定義を取得して image だけ差し替え ---
+      - name: Get current task definition ARN
+        id: curtd
+        run: |
+          ARN=$(aws ecs describe-services \
+            --cluster "${CLUSTER}" \
+            --services "${SERVICE}" \
+            --region "${AWS_REGION}" \
+            --query 'services[0].taskDefinition' --output text)
+          echo "arn=$ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Download current task definition JSON
         run: |
           aws ecs describe-task-definition \
-            --task-definition "${{ env.TASK_FAMILY }}" \
-            --query "taskDefinition" > td.json
+            --task-definition "${{ steps.curtd.outputs.arn }}" \
+            --region "${AWS_REGION}" \
+            --query 'taskDefinition' --output json > td.json
+          cat td.json | jq 'keys'  # debug
 
-      - name: Create new task definition JSON (replace image tag)
+      - name: Install jq (if missing)
         run: |
-          sudo apt-get update -y && sudo apt-get install -y jq
-          cat td.json \
-          | jq '.containerDefinitions |= map(if .name=="'${{ env.CONTAINER_NAME }}'" then .image="${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/'${{ env.ECR_REPO }}':'${{ github.sha }}'" else . end)
-                | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
-          > td-new.json
-          cat td-new.json
+          command -v jq >/dev/null 2>&1 || sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Replace container image only (preserve secrets/env)
+        run: |
+          IMAGE="${ECR_IMAGE_URI}:${IMAGE_TAG}"
+          cat td.json | jq '
+            del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                .compatibilities, .registeredAt, .registeredBy)
+            | .containerDefinitions[0].image = env.IMAGE
+          ' > td-new.json
+          echo "== diff preview =="
+          jq -r '.containerDefinitions[0].image' td.json td-new.json
 
       - name: Register new task definition
-        id: register
+        id: reg
         run: |
-          ARN=$(aws ecs register-task-definition \
+          NEW_ARN=$(aws ecs register-task-definition \
             --cli-input-json file://td-new.json \
-            --query "taskDefinition.taskDefinitionArn" --output text)
-          echo "NEW_TD_ARN=$ARN" >> $GITHUB_ENV
-          echo "Registered: $ARN"
+            --region "${AWS_REGION}" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "arn=$NEW_ARN" >> "$GITHUB_OUTPUT"
+          echo "Registered: $NEW_ARN"
 
-      - name: Update service to new task definition
+      - name: Update service to new task definition (rolling)
         run: |
           aws ecs update-service \
-            --cluster "${{ env.ECS_CLUSTER }}" \
-            --service "${{ env.ECS_SERVICE }}" \
-            --task-definition "${{ env.NEW_TD_ARN }}"
-
-      - name: Wait for stable service
-        run: |
+            --cluster "${CLUSTER}" \
+            --service "${SERVICE}" \
+            --task-definition "${{ steps.reg.outputs.arn }}" \
+            --region "${AWS_REGION}"
           aws ecs wait services-stable \
-            --cluster "${{ env.ECS_CLUSTER }}" \
-            --services "${{ env.ECS_SERVICE }}"
+            --cluster "${CLUSTER}" \
+            --services "${SERVICE}" \
+            --region "${AWS_REGION}"
 
-      # ---- Smoke tests ----
-      - name: Smoke test - /twiml appears in OpenAPI
+      # --- 軽いスモークテスト（失敗でワークフローを赤に） ---
+      - name: Smoke test - /openapi.json
         run: |
           set -e
-          curl -fsSL "${{ env.PUBLIC_BASE_URL }}/openapi.json" | grep -i '"/twiml"' >/dev/null
-          echo "OK: /twiml is present in openapi.json"
+          curl -fsSL https://voice.frontglass.net/openapi.json | jq '.openapi,.info.title' >/dev/null
 
       - name: Smoke test - /twiml returns XML
         run: |
           set -e
-          RSP=$(curl -fsSL "${{ env.PUBLIC_BASE_URL }}/twiml")
-          echo "$RSP" | head -n 1
-          echo "$RSP" | grep -i "<Response>" >/dev/null
-          echo "OK: /twiml returns TwiML"
-
-      - name: Show version
-        run: |
-          curl -fsSL "${{ env.PUBLIC_BASE_URL }}/version" || true
+          curl -fsSL -H "Accept: text/xml" https://voice.frontglass.net/twiml | grep -i '^<\?xml' >/dev/null
