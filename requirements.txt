@@ -1,9 +1,8 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
-
-# Twilio→WS 音声のリアルタイムSTTに必要
 amazon-transcribe==0.6.2
+boto3==1.34.162
 
-# いまは未使用でも残してOK（将来のTTS/STTで使うなら）
+# 将来用（残してOK）
 google-cloud-texttospeech==2.16.5
 google-cloud-speech==2.26.0
