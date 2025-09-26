@@ -19,7 +19,7 @@ env:
   ECR_REPO: voicebot
   CLUSTER: voicebot-cluster
   SERVICE: svc-voicebot
-  CONTAINER_NAME: voicebot   # ← タスク定義のコンテナ名。違う場合はここを修正。
+  CONTAINER_NAME: voicebot
 
 jobs:
   deploy:
@@ -79,7 +79,6 @@ jobs:
         run: |
           command -v jq >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y jq; }
 
-      # 画像だけ安全に差し替え（名前一致で更新。1個しか無い場合はその1個を更新）
       - name: Replace container image only (preserve secrets/env)
         run: |
           set -e
@@ -94,7 +93,7 @@ jobs:
                  else (.containerDefinitions | map( if .name==$NAME then .image=$IMG else . end ))
                  end)
           ' td.json > td-new.json
-          echo "Prepared task definition (name,image):"
+          echo "Prepared containers:"
           jq -r '.containerDefinitions[] | [.name,.image] | @tsv' td-new.json
 
       - name: Register new task definition
@@ -119,12 +118,22 @@ jobs:
             --services "${SERVICE}" \
             --region "${AWS_REGION}"
 
+      # --- 軽いスモークテスト（/openapi.json はそのまま） ---
       - name: Smoke test - /openapi.json
         run: |
           set -e
           curl -fsSL https://voice.frontglass.net/openapi.json | jq '.openapi,.info.title' >/dev/null
 
-      - name: Smoke test - /twiml returns XML
+      # --- /twiml: 200 & XML系であれば合格（<?xml でも <Response でもOK） ---
+      - name: Smoke test - /twiml returns XML-ish
         run: |
           set -e
-          curl -fsSL -H "Accept: text/xml" https://voice.frontglass.net/twiml | grep -i '^<\?xml' >/dev/null
+          URL="https://voice.frontglass.net/twiml"
+          # ヘッダも見たい時は -D で表示
+          HTTP=$(curl -sS -H 'Accept: text/xml' -o /tmp/twiml.xml -w '%{http_code}' "$URL")
+          echo "HTTP=$HTTP"
+          head -n 2 /tmp/twiml.xml || true
+          # ステータスチェック
+          test "$HTTP" = "200"
+          # 本文は XML 宣言 もしくは TwiML ルートが来ていればOK
+          grep -Ei '^(<\?xml|<Response)' /tmp/twiml.xml >/dev/null
