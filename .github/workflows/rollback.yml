@@ -1,0 +1,111 @@
+name: Rollback ECS service
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_revision:
+        description: "任意: voicebot-task のリビジョン番号（例: 58）。未指定なら直前のリビジョンへ戻す"
+        required: false
+        type: string
+
+env:
+  AWS_REGION: ap-northeast-1
+  CLUSTER: voicebot-cluster
+  SERVICE: svc-voicebot
+  TASK_FAMILY: voicebot-task
+  PROD_URL: https://voice.frontglass.net
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # （重要）ここは deploy.yml と同じ認証方法にしてください
+      # OIDCロール運用の場合（推奨）：Secrets に AWS_ROLE_ARN を入れてある前提
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Find current taskDefinition
+        id: cur
+        run: |
+          set -euo pipefail
+          CUR_TD=$(aws ecs describe-services \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE" \
+            --query 'services[0].taskDefinition' \
+            --output text)
+          echo "current=$CUR_TD"
+          echo "current=$CUR_TD" >> $GITHUB_OUTPUT
+
+      - name: Decide target taskDefinition
+        id: tgt
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.target_revision }}" ]; then
+            # ユーザー指定のリビジョンへ
+            TGT_TD="arn:aws:ecs:${AWS_REGION}:${{ secrets.AWS_ACCOUNT_ID }}:task-definition/${TASK_FAMILY}:${{ inputs.target_revision }}"
+          else
+            # 直前のリビジョンを自動選択（Activeを新しい順に並べて2番目＝直前）
+            TGT_TD=$(aws ecs list-task-definitions \
+              --family-prefix "$TASK_FAMILY" \
+              --status ACTIVE \
+              --sort DESC \
+              --query 'taskDefinitionArns[1]' \
+              --output text)
+          fi
+
+          if [ -z "$TGT_TD" ] || [ "$TGT_TD" = "None" ]; then
+            echo "ターゲットのタスク定義が見つかりませんでした"; exit 1
+          fi
+
+          echo "target=$TGT_TD"
+          echo "target=$TGT_TD" >> $GITHUB_OUTPUT
+
+      - name: Update service to target taskDefinition (rolling)
+        run: |
+          set -euo pipefail
+          aws ecs update-service \
+            --cluster "$CLUSTER" \
+            --service "$SERVICE" \
+            --task-definition "${{ steps.tgt.outputs.target }}"
+
+      - name: Wait until service stable
+        run: |
+          aws ecs wait services-stable \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE"
+
+      # 簡易スモーク (本番URLに対して)
+      - name: Smoke - /version returns JSON
+        run: |
+          set -e
+          URL="${PROD_URL}/version"
+          echo "GET $URL"
+          RES=$(curl -sS -w "\n%{http_code}" "$URL")
+          BODY=$(echo "$RES" | sed '$d')
+          CODE=$(echo "$RES" | tail -n1)
+          echo "HTTP $CODE"
+          echo "$BODY" | jq '.app' >/dev/null
+          test "$CODE" = "200"
+
+      - name: Smoke - /twiml returns XML
+        run: |
+          set -e
+          URL="${PROD_URL}/twiml"
+          echo "GET $URL"
+          RES=$(curl -sS -H "Accept: text/xml" -w "\n%{http_code}" "$URL")
+          BODY=$(echo "$RES" | sed '$d')
+          CODE=$(echo "$RES" | tail -n1)
+          echo "HTTP $CODE"
+          echo "$BODY" | grep -q "<Response>"
+          test "$CODE" = "200"
