@@ -1,12 +1,7 @@
-name: Rollback ECS service
+name: Rollback ECS service (one-click, previous revision)
 
 on:
-  workflow_dispatch:
-    inputs:
-      target_revision:
-        description: "任意: voicebot-task のリビジョン番号（例: 58）。未指定なら直前のリビジョンへ戻す"
-        required: false
-        type: string
+  workflow_dispatch: {}   # 入力なし。押すだけで直前に戻す
 
 env:
   AWS_REGION: ap-northeast-1
@@ -26,7 +21,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ▼ deploy.yml と同じ「アクセスキー方式」に変更
+      # 認証（deploy.yml と同じ「アクセスキー方式」）
       - name: Configure AWS credentials (keys)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -34,40 +29,41 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Find current taskDefinition
+      - name: Show current service taskDefinition
         id: cur
         run: |
           set -euo pipefail
-          CUR_TD=$(aws ecs describe-services \
+          CUR=$(aws ecs describe-services \
             --cluster "$CLUSTER" \
             --services "$SERVICE" \
-            --query 'services[0].taskDefinition' \
-            --output text)
-          echo "current=$CUR_TD" >> $GITHUB_OUTPUT
+            --query 'services[0].taskDefinition' --output text)
+          echo "current=$CUR"
+          echo "current=$CUR" >> $GITHUB_OUTPUT
 
-      - name: Decide target taskDefinition
-        id: tgt
+      - name: Pick previous ACTIVE taskDefinition (auto)
+        id: prev
         run: |
           set -euo pipefail
-          if [ -n "${{ inputs.target_revision }}" ]; then
-            TGT_TD="arn:aws:ecs:${AWS_REGION}:${{ secrets.AWS_ACCOUNT_ID }}:task-definition/${TASK_FAMILY}:${{ inputs.target_revision }}"
-          else
-            TGT_TD=$(aws ecs list-task-definitions \
-              --family-prefix "$TASK_FAMILY" \
-              --status ACTIVE \
-              --sort DESC \
-              --query 'taskDefinitionArns[1]' \
-              --output text)
-          fi
-          test -n "$TGT_TD" && [ "$TGT_TD" != "None" ]
-          echo "target=$TGT_TD" >> $GITHUB_OUTPUT
+          # ACTIVE の新しい順に2件取り、2番目（=直前）を選ぶ
+          PREV=$(aws ecs list-task-definitions \
+            --family-prefix "$TASK_FAMILY" \
+            --status ACTIVE \
+            --sort DESC \
+            --query 'taskDefinitionArns[1]' --output text)
+          echo "previous=$PREV"
+          test -n "$PREV" && [ "$PREV" != "None" ]
+          echo "previous=$PREV" >> $GITHUB_OUTPUT
 
-      - name: Update service to target taskDefinition (rolling)
+      - name: Update service to previous taskDefinition
         run: |
+          set -euo pipefail
+          if [ "${{ steps.cur.outputs.current }}" = "${{ steps.prev.outputs.previous }}" ]; then
+            echo "NOTE: 現在すでに直前リビジョンを使用中のようです。処理を継続します。"
+          fi
           aws ecs update-service \
             --cluster "$CLUSTER" \
             --service "$SERVICE" \
-            --task-definition "${{ steps.tgt.outputs.target }}"
+            --task-definition "${{ steps.prev.outputs.previous }}"
 
       - name: Wait until service stable
         run: |
@@ -75,20 +71,23 @@ jobs:
             --cluster "$CLUSTER" \
             --services "$SERVICE"
 
+      # 簡易スモーク（本番URLに対して）
       - name: Smoke - /version returns JSON
         run: |
           set -e
           URL="${PROD_URL}/version"
+          echo "GET $URL"
           RES=$(curl -sS -w "\n%{http_code}" "$URL")
           BODY=$(echo "$RES" | sed '$d'); CODE=$(echo "$RES" | tail -n1)
           echo "HTTP $CODE"; test "$CODE" = "200"
-          echo "$BODY" | jq '.app' >/dev/null
+          echo "$BODY" | jq -e '.app=="voicebot"' >/dev/null
 
-      - name: Smoke - /twiml returns XML
+      - name: Smoke - /twiml returns XML-ish
         run: |
           set -e
           URL="${PROD_URL}/twiml"
-          RES=$(curl -sS -H "Accept: text/xml" -w "\n%{http_code}" "$URL")
+          echo "GET $URL"
+          RES=$(curl -sS -H 'Accept: text/xml' -w "\n%{http_code}" "$URL")
           BODY=$(echo "$RES" | sed '$d'); CODE=$(echo "$RES" | tail -n1)
           echo "HTTP $CODE"; test "$CODE" = "200"
-          echo "$BODY" | grep -q "<Response>"
+          echo "$BODY" | grep -Eiq '^(<\?xml|<Response)'
