@@ -1,12 +1,13 @@
-# app.py 〈全文〉 v0.8.3
+# app.py 〈全文〉 v0.8.4
 # - STT + S3保存はそのまま
-# - LCC 詳細ログのまま
+# - LCC 詳細ログは維持
 # - Twilio Status Callback を include 済み
-# - ★ /health と /healthz の両方に 200 を返す（ALB 側の設定がどちらでもOK）
+# - ★ フォールバックTwiML：/twiml_stream が WS不調時や手動ON時に <Say> を返す
+# - ★ /admin/fallback/on | /admin/fallback/off で強制切替（簡易）
 
-from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect, Request
 from datetime import datetime, timezone
-import os, json, traceback, base64, audioop, asyncio, uuid
+import os, json, traceback, base64, audioop, asyncio, uuid, time
 from typing import Dict, List, Optional
 
 from amazon_transcribe.client import TranscribeStreamingClient
@@ -16,11 +17,10 @@ from amazon_transcribe.model import TranscriptEvent
 import boto3
 from twilio.rest import Client as TwilioClient
 
-# Twilioステータス受け口のルーター
-from status_routes import router as status_router
+from status_routes import router as status_router  # /twilio/status
 
 APP_NAME = "voicebot"
-APP_VERSION = "0.8.3"  # add /healthz alias
+APP_VERSION = "0.8.4"  # fallback twiml + healthz
 
 SAMPLE_RATE = 8000
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-1")
@@ -30,6 +30,18 @@ S3_BUCKET = os.getenv("TRANSCRIPT_BUCKET", f"voicebot-transcripts-291234479055-{
 
 TW_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TW_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+
+# ===== Fallback control =====
+FALLBACK_FORCE: bool = False                 # 手動強制のON/OFF
+LAST_WS_ERROR_AT: Optional[float] = None     # 直近エラー時刻（epoch）
+WS_ERROR_WINDOW_SEC = 120                    # 直近N秒は不調とみなす
+
+def ws_recently_failed() -> bool:
+    if LAST_WS_ERROR_AT is None:
+        return False
+    return (time.time() - LAST_WS_ERROR_AT) < WS_ERROR_WINDOW_SEC
+
+# =========================================
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 app.include_router(status_router)
@@ -45,13 +57,13 @@ def add_recent(call_id: str, text: str, started_at: str, finished_at: str):
 @app.get("/")
 async def root_get(): 
     return {"message":"ok","app":APP_NAME,"version":APP_VERSION,
-            "twilio_env":{"sid": bool(TW_SID), "token": bool(TW_TOKEN)}}
+            "twilio_env":{"sid": bool(TW_SID), "token": bool(TW_TOKEN)},
+            "fallback":{"force": FALLBACK_FORCE, "recent_ws_error": ws_recently_failed()}}
 
 @app.get("/health")
 async def health_get(): 
     return {"status":"ok"}
 
-# ★ 追加: /healthz も 200 を返す
 @app.get("/healthz")
 async def healthz_get():
     return {"status":"ok"}
@@ -59,8 +71,23 @@ async def healthz_get():
 @app.get("/version")
 async def version_get():
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return {"app":APP_NAME,"deploy_stamp":{"raw":"deployed","time_utc":now_utc,"commit_sha":os.getenv("COMMIT_SHA","unknown")}}
+    return {"app":APP_NAME,"deploy_stamp":{"raw":"deployed","time_utc":now_utc,"commit_sha":os.getenv("COMMIT_SHA","unknown")},
+            "version": APP_VERSION}
 
+# ---- フォールバック手動トグル（簡易） ----
+@app.get("/admin/fallback/on")
+async def fallback_on():
+    global FALLBACK_FORCE
+    FALLBACK_FORCE = True
+    return {"fallback_force": True}
+
+@app.get("/admin/fallback/off")
+async def fallback_off():
+    global FALLBACK_FORCE
+    FALLBACK_FORCE = False
+    return {"fallback_force": False}
+
+# ---- TwiML ----
 @app.get("/twiml")
 @app.post("/twiml")
 async def twiml():
@@ -71,18 +98,38 @@ async def twiml():
 </Response>''')
     return Response(content=xml, media_type="text/xml")
 
+def build_reply_twiml(reply_text: str, ws_url: str) -> str:
+    return (f'''<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say language="ja-JP">{reply_text}</Say>
+  <Connect><Stream url="{ws_url}"/></Connect>
+</Response>''')
+
+def build_fallback_twiml() -> str:
+    return ('''<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say language="ja-JP">現在回線が混み合っています。恐れ入りますが、しばらくしてからおかけ直しください。</Say>
+  <Hangup/>
+</Response>''')
+
 @app.get("/twiml_stream")
 @app.post("/twiml_stream")
-async def twiml_stream():
+async def twiml_stream(req: Request):
+    # 直近のWSエラー or 手動強制ならフォールバック
+    if FALLBACK_FORCE or ws_recently_failed():
+        xml = build_fallback_twiml()
+        return Response(content=xml, media_type="text/xml")
+
+    # 通常は WebSocket 接続
     ws_url = "wss://voice.frontglass.net/stream"
     xml=(f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say language="ja-JP">テスト</Say>
   <Say language="ja-JP">接続テストを開始します。</Say>
   <Connect><Stream url="{ws_url}"/></Connect>
 </Response>''')
     return Response(content=xml, media_type="text/xml")
 
+# ---- WebSocket（Twilio Media Streams）----
 class MyTranscriptHandler(TranscriptResultStreamHandler):
     def __init__(self, output_stream, on_partial, on_final):
         super().__init__(output_stream)
@@ -100,15 +147,9 @@ class MyTranscriptHandler(TranscriptResultStreamHandler):
             else:
                 self.on_final(text)
 
-def build_reply_twiml(reply_text: str, ws_url: str) -> str:
-    return (f'''<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say language="ja-JP">{reply_text}</Say>
-  <Connect><Stream url="{ws_url}"/></Connect>
-</Response>''')
-
 @app.websocket("/stream")
 async def stream_ws(ws: WebSocket):
+    global LAST_WS_ERROR_AT
     await ws.accept()
     call_id = str(uuid.uuid4())[:8]
     started_at = datetime.now(timezone.utc).isoformat()
@@ -199,6 +240,8 @@ async def stream_ws(ws: WebSocket):
         except WebSocketDisconnect:
             pass
         except Exception:
+            # ここで直近WSエラーとして記録（フォールバック判定に使う）
+            LAST_WS_ERROR_AT = time.time()
             traceback.print_exc()
         finally:
             try: 
@@ -210,7 +253,7 @@ async def stream_ws(ws: WebSocket):
         try:
             handler = MyTranscriptHandler(
                 stream.output_stream,
-                on_partial=lambda txt: on_partial(txt),
+                on_partial=lambda txt: print(f"[STT] PARTIAL: {txt}", flush=True),
                 on_final=lambda txt: asyncio.create_task(on_final_async(txt)),
             )
             await handler.handle_events()
