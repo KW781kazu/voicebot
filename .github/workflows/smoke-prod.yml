@@ -1,0 +1,42 @@
+name: Smoke test (production)
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # 毎朝 09:10 JST（= 00:10 UTC）に実行
+    - cron: "10 0 * * *"
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check /version returns JSON
+        run: |
+          set -e
+          URL="https://voice.frontglass.net/version"
+          echo "GET $URL"
+          RES=$(curl -sS -w '\n%{http_code}' "$URL")
+          BODY=$(echo "$RES" | sed '$d')
+          CODE=$(echo "$RES" | tail -n1)
+          echo "HTTP $CODE"
+          echo "$BODY"
+          test "$CODE" = "200"
+          echo "$BODY" | jq -e '.app=="voicebot"' >/dev/null
+
+      - name: Check /twiml returns XML
+        run: |
+          set -e
+          URL="https://voice.frontglass.net/twiml"
+          echo "GET $URL"
+          RES=$(curl -sS -H 'Accept: text/xml' -w '\n%{http_code}' "$URL")
+          BODY=$(echo "$RES" | sed '$d')
+          CODE=$(echo "$RES" | tail -n1)
+          echo "HTTP $CODE"
+          echo "$BODY"
+          test "$CODE" = "200"
+          # XMLっぽいか最低限チェック（<Response> がある）
+          echo "$BODY" | grep -qi '<Response>'
+
+      - name: Summarize
+        run: echo "All green"
