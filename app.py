@@ -1,7 +1,8 @@
-# app.py 〈全文〉 v0.8.2
+# app.py 〈全文〉 v0.8.3
 # - STT + S3保存はそのまま
-# - 返答（Live Call Control）で詳細ログを追加
-# - Twilio Status Callback 受け口（/twilio/status）を有効化（status_routes を include）
+# - LCC 詳細ログのまま
+# - Twilio Status Callback を include 済み
+# - ★ /health と /healthz の両方に 200 を返す（ALB 側の設定がどちらでもOK）
 
 from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect
 from datetime import datetime, timezone
@@ -15,11 +16,11 @@ from amazon_transcribe.model import TranscriptEvent
 import boto3
 from twilio.rest import Client as TwilioClient
 
-# ★ 追加: Twilioステータス受け口のルーター
+# Twilioステータス受け口のルーター
 from status_routes import router as status_router
 
 APP_NAME = "voicebot"
-APP_VERSION = "0.8.2"  # enable /twilio/status
+APP_VERSION = "0.8.3"  # add /healthz alias
 
 SAMPLE_RATE = 8000
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-1")
@@ -31,8 +32,6 @@ TW_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TW_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
-
-# ★ 追加: /twilio/status を組み込み
 app.include_router(status_router)
 
 RECENTS: List[Dict] = []
@@ -49,7 +48,13 @@ async def root_get():
             "twilio_env":{"sid": bool(TW_SID), "token": bool(TW_TOKEN)}}
 
 @app.get("/health")
-async def health_get(): return {"status":"ok"}
+async def health_get(): 
+    return {"status":"ok"}
+
+# ★ 追加: /healthz も 200 を返す
+@app.get("/healthz")
+async def healthz_get():
+    return {"status":"ok"}
 
 @app.get("/version")
 async def version_get():
@@ -169,7 +174,6 @@ async def stream_ws(ws: WebSocket):
                     if et in ("connected","start","stop","mark"):
                         print(f"[WS] {et}", flush=True)
                     if et == "start":
-                        # 受け取った start payload をそのまま出力（1行）
                         try:
                             print(f"[WS] start payload: {json.dumps(e.get('start',{}), ensure_ascii=False)}", flush=True)
                         except Exception:
