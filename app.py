@@ -1,9 +1,7 @@
-# app.py 〈全文〉 v0.8.1
+# app.py 〈全文〉 v0.8.2
 # - STT + S3保存はそのまま
 # - 返答（Live Call Control）で詳細ログを追加
-#   * 起動時: Twilio 環境変数があるか
-#   * [WS] start で受けた payload をそのまま1行で出力
-#   * 返信直前/直後/失敗時の例外内容を出力
+# - Twilio Status Callback 受け口（/twilio/status）を有効化（status_routes を include）
 
 from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect
 from datetime import datetime, timezone
@@ -17,8 +15,11 @@ from amazon_transcribe.model import TranscriptEvent
 import boto3
 from twilio.rest import Client as TwilioClient
 
+# ★ 追加: Twilioステータス受け口のルーター
+from status_routes import router as status_router
+
 APP_NAME = "voicebot"
-APP_VERSION = "0.8.1"  # debug logs for LCC
+APP_VERSION = "0.8.2"  # enable /twilio/status
 
 SAMPLE_RATE = 8000
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-1")
@@ -30,6 +31,9 @@ TW_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TW_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
+
+# ★ 追加: /twilio/status を組み込み
+app.include_router(status_router)
 
 RECENTS: List[Dict] = []
 MAX_RECENTS = 50
