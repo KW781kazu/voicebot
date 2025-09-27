@@ -16,7 +16,6 @@ env:
   PROD_URL: https://voice.frontglass.net
 
 permissions:
-  id-token: write
   contents: read
 
 jobs:
@@ -27,12 +26,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # （重要）ここは deploy.yml と同じ認証方法にしてください
-      # OIDCロール運用の場合（推奨）：Secrets に AWS_ROLE_ARN を入れてある前提
-      - name: Configure AWS credentials (OIDC)
+      # ▼ deploy.yml と同じ「アクセスキー方式」に変更
+      - name: Configure AWS credentials (keys)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Find current taskDefinition
@@ -44,7 +43,6 @@ jobs:
             --services "$SERVICE" \
             --query 'services[0].taskDefinition' \
             --output text)
-          echo "current=$CUR_TD"
           echo "current=$CUR_TD" >> $GITHUB_OUTPUT
 
       - name: Decide target taskDefinition
@@ -52,10 +50,8 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "${{ inputs.target_revision }}" ]; then
-            # ユーザー指定のリビジョンへ
             TGT_TD="arn:aws:ecs:${AWS_REGION}:${{ secrets.AWS_ACCOUNT_ID }}:task-definition/${TASK_FAMILY}:${{ inputs.target_revision }}"
           else
-            # 直前のリビジョンを自動選択（Activeを新しい順に並べて2番目＝直前）
             TGT_TD=$(aws ecs list-task-definitions \
               --family-prefix "$TASK_FAMILY" \
               --status ACTIVE \
@@ -63,17 +59,11 @@ jobs:
               --query 'taskDefinitionArns[1]' \
               --output text)
           fi
-
-          if [ -z "$TGT_TD" ] || [ "$TGT_TD" = "None" ]; then
-            echo "ターゲットのタスク定義が見つかりませんでした"; exit 1
-          fi
-
-          echo "target=$TGT_TD"
+          test -n "$TGT_TD" && [ "$TGT_TD" != "None" ]
           echo "target=$TGT_TD" >> $GITHUB_OUTPUT
 
       - name: Update service to target taskDefinition (rolling)
         run: |
-          set -euo pipefail
           aws ecs update-service \
             --cluster "$CLUSTER" \
             --service "$SERVICE" \
@@ -85,27 +75,20 @@ jobs:
             --cluster "$CLUSTER" \
             --services "$SERVICE"
 
-      # 簡易スモーク (本番URLに対して)
       - name: Smoke - /version returns JSON
         run: |
           set -e
           URL="${PROD_URL}/version"
-          echo "GET $URL"
           RES=$(curl -sS -w "\n%{http_code}" "$URL")
-          BODY=$(echo "$RES" | sed '$d')
-          CODE=$(echo "$RES" | tail -n1)
-          echo "HTTP $CODE"
+          BODY=$(echo "$RES" | sed '$d'); CODE=$(echo "$RES" | tail -n1)
+          echo "HTTP $CODE"; test "$CODE" = "200"
           echo "$BODY" | jq '.app' >/dev/null
-          test "$CODE" = "200"
 
       - name: Smoke - /twiml returns XML
         run: |
           set -e
           URL="${PROD_URL}/twiml"
-          echo "GET $URL"
           RES=$(curl -sS -H "Accept: text/xml" -w "\n%{http_code}" "$URL")
-          BODY=$(echo "$RES" | sed '$d')
-          CODE=$(echo "$RES" | tail -n1)
-          echo "HTTP $CODE"
+          BODY=$(echo "$RES" | sed '$d'); CODE=$(echo "$RES" | tail -n1)
+          echo "HTTP $CODE"; test "$CODE" = "200"
           echo "$BODY" | grep -q "<Response>"
-          test "$CODE" = "200"
