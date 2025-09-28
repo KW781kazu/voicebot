@@ -1,11 +1,13 @@
-# app.py 〈全文〉 v0.8.5
+# app.py 〈全文〉 v0.8.7
 # - 既存機能維持（/health, /healthz, /version, /twiml[_stream], /admin/fallback/*, /twilio/status, STT→S3, LCCログ）
-# - ★ 簡易ルーティング: FINALテキストに基づく用件判定（予約/営業時間/場所/担当者/FAQ/その他）
+# - 簡易ルーティング: FINALテキストに基づく用件判定（予約/営業時間/場所/担当者/FAQ/その他）
+# - SMS自動送信: 意図に応じて営業時間/アクセス/FAQのSMSを送信
+# - ★ 店舗所在地の本番設定: アクセスSMSに「埼玉県上尾市菅谷3-4-1」とGoogleマップリンクを送付
 
 from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect, Request, APIRouter, Form
 from datetime import datetime, timezone
-import os, json, traceback, base64, audioop, asyncio, uuid, time, re
-from typing import Dict, List, Optional
+import os, json, traceback, base64, audioop, asyncio, uuid, time, re, urllib.parse
+from typing import Dict, List, Optional, Tuple
 
 from amazon_transcribe.client import TranscribeStreamingClient
 from amazon_transcribe.handlers import TranscriptResultStreamHandler
@@ -23,12 +25,11 @@ async def twilio_status(
     From: str = Form(default=""),
     To: str = Form(default="")
 ):
-    # 単純に 200 を返し、ログには CloudWatch 側で出力（uvicornの標準出力）
     print(f"[TW] status sid={CallSid} status={CallStatus} from={From} to={To}", flush=True)
     return {"ok": True}
 
 APP_NAME = "voicebot"
-APP_VERSION = "0.8.5"
+APP_VERSION = "0.8.7"
 
 SAMPLE_RATE = 8000
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-1")
@@ -38,6 +39,8 @@ S3_BUCKET = os.getenv("TRANSCRIPT_BUCKET", f"voicebot-transcripts-291234479055-{
 
 TW_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TW_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+# 送信元SMS番号（E.164形式。例: +8150xxxxxxx）※未設定でも CallSid から取得可能な場合あり
+TW_FROM = os.getenv("TWILIO_FROM", "")
 
 # ===== Fallback control =====
 FALLBACK_FORCE: bool = False
@@ -61,7 +64,7 @@ def add_recent(call_id: str, text: str, started_at: str, finished_at: str):
 @app.get("/")
 async def root_get():
     return {"message":"ok","app":APP_NAME,"version":APP_VERSION,
-            "twilio_env":{"sid": bool(TW_SID), "token": bool(TW_TOKEN)},
+            "twilio_env":{"sid": bool(TW_SID), "token": bool(TW_TOKEN), "from": bool(TW_FROM)},
             "fallback":{"force": FALLBACK_FORCE, "recent_ws_error": ws_recently_failed()}}
 
 @app.get("/health")
@@ -131,33 +134,63 @@ async def twiml_stream(req: Request):
 # ---- 簡易ルーティング ----
 def classify_intent(text: str) -> str:
     t = text.lower()
-    # 予約
     if re.search(r"予約|よやく|book|reserve", t): return "reserve"
-    # 営業時間
     if re.search(r"営業時間|何時|open|close|いつまで", t): return "hours"
-    # 場所・アクセス
-    if re.search(r"住所|場所|アクセス|行き方|どこ|最寄り|駐車|parking", t): return "access"
-    # 担当者・折返し
+    if re.search(r"住所|場所|アクセス|行き方|どこ|最寄り|駐車|parking|map|地図", t): return "access"
     if re.search(r"担当|折り返し|オペレーター|人と話|転送|代表", t): return "agent"
-    # よくある
     if re.search(r"料金|値段|価格|支払|決済|方法|メール", t): return "faq"
     return "other"
 
-def make_reply_by_intent(text: str) -> str:
+def make_reply_by_intent(text: str) -> Tuple[str, Optional[str]]:
+    """return: (voice_reply, sms_key)"""
     intent = classify_intent(text)
     if intent == "reserve":
-        return "ご予約の件ですね。ご希望の日時と内容をお話しください。オペレーターが後ほど確認のうえ、SMSでご案内します。"
+        return ("ご予約の件ですね。ご希望の日時と内容をお話しください。オペレーターが後ほど確認のうえ、SMSでご案内します。", None)
     if intent == "hours":
-        return "本日の営業時間は朝10時から夜7時までです。その他の曜日はウェブサイトでもご確認いただけます。"
+        return ("本日の営業時間は朝10時から夜7時までです。詳細はSMSのリンクをご覧ください。", "hours")
     if intent == "access":
-        return "所在地は新橋駅から徒歩3分です。詳しい道順のリンクをSMSでお送りします。"
+        return ("所在地はSMSでお送りします。ご確認ください。", "access")
     if intent == "agent":
-        return "担当者への取次をご希望ですね。只今の時間は自動応答のみのため、折り返しをご希望でしたらお名前とお電話番号をどうぞ。"
+        return ("担当者への取次をご希望ですね。折り返しをご希望でしたらお名前とお電話番号をどうぞ。", None)
     if intent == "faq":
-        return "よくあるご質問ですね。料金やお支払い方法の詳細はウェブサイトにまとまっています。SMSでURLをお送りします。"
-    # other
+        return ("料金やお支払い方法についてですね。SMSでご案内ページのリンクを送ります。", "faq")
     clipped = text[:30]
-    return f"承知しました。今、『{clipped}』と伺いました。詳しいご要件を続けてどうぞ。"
+    return (f"承知しました。今、『{clipped}』と伺いました。詳しいご要件を続けてどうぞ。", None)
+
+# === 店舗情報（必要に応じ編集） ===
+STORE_ADDRESS = "埼玉県上尾市菅谷3-4-1"
+def sms_template(kind: str) -> str:
+    if kind == "hours":
+        # TODO: 営業時間の実URLに差し替え
+        return "営業時間のご案内です： https://example.com/hours"
+    if kind == "access":
+        # 住所 + Googleマップ検索リンクを同梱
+        q = urllib.parse.quote(STORE_ADDRESS)
+        maps = f"https://maps.google.com/?q={q}"
+        return f"店舗所在地：{STORE_ADDRESS}\n地図：{maps}"
+    if kind == "faq":
+        # TODO: 実サイトのFAQ/料金ページURLに差し替え
+        return "よくあるご質問と料金一覧： https://example.com/faq"
+    return ""
+
+def try_send_sms(call_sid: str, sms_body: str):
+    if not (TW_SID and TW_TOKEN and sms_body):
+        print("[SMS] skipped: env or body missing", flush=True)
+        return
+    try:
+        tw = TwilioClient(TW_SID, TW_TOKEN)
+        # CallSid から From/To を取得（発信者に送る）
+        c = tw.calls(call_sid).fetch()
+        to_number = getattr(c, "from_", None)
+        from_number = TW_FROM or getattr(c, "to", None)
+        if not (to_number and from_number):
+            print(f"[SMS] skipped: number missing to={to_number} from={from_number}", flush=True)
+            return
+        tw.messages.create(to=to_number, from_=from_number, body=sms_body)
+        print(f"[SMS] sent to={to_number} from={from_number} body='{sms_body}'", flush=True)
+    except Exception as e:
+        print(f"[SMS] failed: {repr(e)}", flush=True)
+        traceback.print_exc()
 
 # ---- WebSocket（Twilio Media Streams）----
 class MyTranscriptHandler(TranscriptResultStreamHandler):
@@ -185,7 +218,7 @@ async def stream_ws(ws: WebSocket):
     started_at = datetime.now(timezone.utc).isoformat()
     print(f"[WS] OPEN call={call_id} at {started_at}", flush=True)
 
-    print(f"[BOOT] TW_SID={bool(TW_SID)} TW_TOKEN={bool(TW_TOKEN)}", flush=True)
+    print(f"[BOOT] TW_SID={bool(TW_SID)} TW_TOKEN={bool(TW_TOKEN)} TW_FROM={bool(TW_FROM)}", flush=True)
 
     s3 = boto3.client("s3", region_name=AWS_REGION)
     finals: List[str] = []
@@ -216,12 +249,16 @@ async def stream_ws(ws: WebSocket):
         try:
             tw = TwilioClient(TW_SID, TW_TOKEN)
             ws_url = "wss://voice.frontglass.net/stream"
-            reply = make_reply_by_intent(text)
+            reply, sms_key = make_reply_by_intent(text)
             twml = build_reply_twiml(reply, ws_url)
             print(f"[LCC] try redirect callSid={call_sid} text='{text}'", flush=True)
             tw.calls(call_sid).update(twiml=twml)
             replied_once = True
             print(f"[LCC] replied via TwiML redirect (callSid={call_sid})", flush=True)
+            # SMS（必要なときだけ）
+            if sms_key:
+                body = sms_template(sms_key)
+                try_send_sms(call_sid, body)
         except Exception as e:
             print(f"[LCC] reply failed: {repr(e)}", flush=True)
             traceback.print_exc()
