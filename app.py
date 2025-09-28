@@ -1,13 +1,10 @@
-# app.py 〈全文〉 v0.8.4
-# - STT + S3保存はそのまま
-# - LCC 詳細ログは維持
-# - Twilio Status Callback を include 済み
-# - ★ フォールバックTwiML：/twiml_stream が WS不調時や手動ON時に <Say> を返す
-# - ★ /admin/fallback/on | /admin/fallback/off で強制切替（簡易）
+# app.py 〈全文〉 v0.8.5
+# - 既存機能維持（/health, /healthz, /version, /twiml[_stream], /admin/fallback/*, /twilio/status, STT→S3, LCCログ）
+# - ★ 簡易ルーティング: FINALテキストに基づく用件判定（予約/営業時間/場所/担当者/FAQ/その他）
 
-from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect, Request, APIRouter, Form
 from datetime import datetime, timezone
-import os, json, traceback, base64, audioop, asyncio, uuid, time
+import os, json, traceback, base64, audioop, asyncio, uuid, time, re
 from typing import Dict, List, Optional
 
 from amazon_transcribe.client import TranscribeStreamingClient
@@ -17,10 +14,21 @@ from amazon_transcribe.model import TranscriptEvent
 import boto3
 from twilio.rest import Client as TwilioClient
 
-from status_routes import router as status_router  # /twilio/status
+# ---- Twilio status callback minimal router ----
+router = APIRouter()
+@router.post("/twilio/status")
+async def twilio_status(
+    CallSid: str = Form(default=""),
+    CallStatus: str = Form(default=""),
+    From: str = Form(default=""),
+    To: str = Form(default="")
+):
+    # 単純に 200 を返し、ログには CloudWatch 側で出力（uvicornの標準出力）
+    print(f"[TW] status sid={CallSid} status={CallStatus} from={From} to={To}", flush=True)
+    return {"ok": True}
 
 APP_NAME = "voicebot"
-APP_VERSION = "0.8.4"  # fallback twiml + healthz
+APP_VERSION = "0.8.5"
 
 SAMPLE_RATE = 8000
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-1")
@@ -32,19 +40,15 @@ TW_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TW_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 
 # ===== Fallback control =====
-FALLBACK_FORCE: bool = False                 # 手動強制のON/OFF
-LAST_WS_ERROR_AT: Optional[float] = None     # 直近エラー時刻（epoch）
-WS_ERROR_WINDOW_SEC = 120                    # 直近N秒は不調とみなす
-
+FALLBACK_FORCE: bool = False
+LAST_WS_ERROR_AT: Optional[float] = None
+WS_ERROR_WINDOW_SEC = 120
 def ws_recently_failed() -> bool:
-    if LAST_WS_ERROR_AT is None:
-        return False
-    return (time.time() - LAST_WS_ERROR_AT) < WS_ERROR_WINDOW_SEC
-
+    return (LAST_WS_ERROR_AT is not None) and ((time.time() - LAST_WS_ERROR_AT) < WS_ERROR_WINDOW_SEC)
 # =========================================
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
-app.include_router(status_router)
+app.include_router(router)
 
 RECENTS: List[Dict] = []
 MAX_RECENTS = 50
@@ -55,18 +59,16 @@ def add_recent(call_id: str, text: str, started_at: str, finished_at: str):
         RECENTS.pop()
 
 @app.get("/")
-async def root_get(): 
+async def root_get():
     return {"message":"ok","app":APP_NAME,"version":APP_VERSION,
             "twilio_env":{"sid": bool(TW_SID), "token": bool(TW_TOKEN)},
             "fallback":{"force": FALLBACK_FORCE, "recent_ws_error": ws_recently_failed()}}
 
 @app.get("/health")
-async def health_get(): 
-    return {"status":"ok"}
+async def health_get(): return {"status":"ok"}
 
 @app.get("/healthz")
-async def healthz_get():
-    return {"status":"ok"}
+async def healthz_get(): return {"status":"ok"}
 
 @app.get("/version")
 async def version_get():
@@ -74,7 +76,7 @@ async def version_get():
     return {"app":APP_NAME,"deploy_stamp":{"raw":"deployed","time_utc":now_utc,"commit_sha":os.getenv("COMMIT_SHA","unknown")},
             "version": APP_VERSION}
 
-# ---- フォールバック手動トグル（簡易） ----
+# ---- 管理用トグル ----
 @app.get("/admin/fallback/on")
 async def fallback_on():
     global FALLBACK_FORCE
@@ -115,19 +117,47 @@ def build_fallback_twiml() -> str:
 @app.get("/twiml_stream")
 @app.post("/twiml_stream")
 async def twiml_stream(req: Request):
-    # 直近のWSエラー or 手動強制ならフォールバック
     if FALLBACK_FORCE or ws_recently_failed():
         xml = build_fallback_twiml()
         return Response(content=xml, media_type="text/xml")
-
-    # 通常は WebSocket 接続
     ws_url = "wss://voice.frontglass.net/stream"
     xml=(f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say language="ja-JP">接続テストを開始します。</Say>
+  <Say language="ja-JP">お電話ありがとうございます。接続テストを開始します。ご用件をどうぞ。</Say>
   <Connect><Stream url="{ws_url}"/></Connect>
 </Response>''')
     return Response(content=xml, media_type="text/xml")
+
+# ---- 簡易ルーティング ----
+def classify_intent(text: str) -> str:
+    t = text.lower()
+    # 予約
+    if re.search(r"予約|よやく|book|reserve", t): return "reserve"
+    # 営業時間
+    if re.search(r"営業時間|何時|open|close|いつまで", t): return "hours"
+    # 場所・アクセス
+    if re.search(r"住所|場所|アクセス|行き方|どこ|最寄り|駐車|parking", t): return "access"
+    # 担当者・折返し
+    if re.search(r"担当|折り返し|オペレーター|人と話|転送|代表", t): return "agent"
+    # よくある
+    if re.search(r"料金|値段|価格|支払|決済|方法|メール", t): return "faq"
+    return "other"
+
+def make_reply_by_intent(text: str) -> str:
+    intent = classify_intent(text)
+    if intent == "reserve":
+        return "ご予約の件ですね。ご希望の日時と内容をお話しください。オペレーターが後ほど確認のうえ、SMSでご案内します。"
+    if intent == "hours":
+        return "本日の営業時間は朝10時から夜7時までです。その他の曜日はウェブサイトでもご確認いただけます。"
+    if intent == "access":
+        return "所在地は新橋駅から徒歩3分です。詳しい道順のリンクをSMSでお送りします。"
+    if intent == "agent":
+        return "担当者への取次をご希望ですね。只今の時間は自動応答のみのため、折り返しをご希望でしたらお名前とお電話番号をどうぞ。"
+    if intent == "faq":
+        return "よくあるご質問ですね。料金やお支払い方法の詳細はウェブサイトにまとまっています。SMSでURLをお送りします。"
+    # other
+    clipped = text[:30]
+    return f"承知しました。今、『{clipped}』と伺いました。詳しいご要件を続けてどうぞ。"
 
 # ---- WebSocket（Twilio Media Streams）----
 class MyTranscriptHandler(TranscriptResultStreamHandler):
@@ -186,7 +216,7 @@ async def stream_ws(ws: WebSocket):
         try:
             tw = TwilioClient(TW_SID, TW_TOKEN)
             ws_url = "wss://voice.frontglass.net/stream"
-            reply = f"こちらはボイスボットです。今、「{text[:30]}」と聞こえました。ご用件をどうぞ。"
+            reply = make_reply_by_intent(text)
             twml = build_reply_twiml(reply, ws_url)
             print(f"[LCC] try redirect callSid={call_sid} text='{text}'", flush=True)
             tw.calls(call_sid).update(twiml=twml)
@@ -240,7 +270,6 @@ async def stream_ws(ws: WebSocket):
         except WebSocketDisconnect:
             pass
         except Exception:
-            # ここで直近WSエラーとして記録（フォールバック判定に使う）
             LAST_WS_ERROR_AT = time.time()
             traceback.print_exc()
         finally:
@@ -253,7 +282,7 @@ async def stream_ws(ws: WebSocket):
         try:
             handler = MyTranscriptHandler(
                 stream.output_stream,
-                on_partial=lambda txt: print(f"[STT] PARTIAL: {txt}", flush=True),
+                on_partial=lambda txt: on_partial(txt),
                 on_final=lambda txt: asyncio.create_task(on_final_async(txt)),
             )
             await handler.handle_events()
