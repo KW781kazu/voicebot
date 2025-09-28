@@ -1,6 +1,7 @@
-# app.py 〈全文〉 v0.8.8
+# app.py 〈全文〉 v0.8.9
+# - 修正: 複数デコレータを1行に書いていた箇所をすべて分離（SyntaxError対策）
 # - /twilio/status で CallSid→(From,To) をキャッシュして SMS 宛先を確実化
-# - それ以外の機能は v0.8.7 と同一（住所SMSは「埼玉県上尾市菅谷3-4-1」）
+# - 住所SMS: 「埼玉県上尾市菅谷3-4-1」+ Googleマップリンク
 
 from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect, Request, APIRouter, Form
 from datetime import datetime, timezone
@@ -25,7 +26,6 @@ async def twilio_status(
     From: str = Form(default=""),
     To: str = Form(default="")
 ):
-    # ログ & キャッシュ
     print(f"[TW] status sid={CallSid} status={CallStatus} from={From} to={To}", flush=True)
     if CallSid:
         d = CALL_NUMS.get(CallSid, {})
@@ -35,7 +35,7 @@ async def twilio_status(
     return {"ok": True}
 
 APP_NAME = "voicebot"
-APP_VERSION = "0.8.8"
+APP_VERSION = "0.8.9"
 
 SAMPLE_RATE = 8000
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-1")
@@ -63,24 +63,41 @@ def add_recent(call_id: str, text: str, started_at: str, finished_at: str):
     if len(RECENTS) > MAX_RECENTS:
         RECENTS.pop()
 
-@app.get("/") async def root_get():
+@app.get("/")
+async def root_get():
     return {"message":"ok","app":APP_NAME,"version":APP_VERSION,
             "twilio_env":{"sid": bool(TW_SID), "token": bool(TW_TOKEN), "from": bool(TW_FROM)},
             "fallback":{"force": FALLBACK_FORCE, "recent_ws_error": ws_recently_failed()}}
 
-@app.get("/health") async def health_get(): return {"status":"ok"}
-@app.get("/healthz") async def healthz_get(): return {"status":"ok"}
-@app.get("/version") async def version_get():
+@app.get("/health")
+async def health_get():
+    return {"status":"ok"}
+
+@app.get("/healthz")
+async def healthz_get():
+    return {"status":"ok"}
+
+@app.get("/version")
+async def version_get():
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return {"app":APP_NAME,"deploy_stamp":{"raw":"deployed","time_utc":now_utc,"commit_sha":os.getenv("COMMIT_SHA","unknown")},
+    return {"app":APP_NAME,
+            "deploy_stamp":{"raw":"deployed","time_utc":now_utc,"commit_sha":os.getenv("COMMIT_SHA","unknown")},
             "version": APP_VERSION}
 
-@app.get("/admin/fallback/on") async def fallback_on():
-    global FALLBACK_FORCE; FALLBACK_FORCE = True; return {"fallback_force": True}
-@app.get("/admin/fallback/off") async def fallback_off():
-    global FALLBACK_FORCE; FALLBACK_FORCE = False; return {"fallback_force": False}
+@app.get("/admin/fallback/on")
+async def fallback_on():
+    global FALLBACK_FORCE
+    FALLBACK_FORCE = True
+    return {"fallback_force": True}
 
-@app.get("/twiml") @app.post("/twiml")
+@app.get("/admin/fallback/off")
+async def fallback_off():
+    global FALLBACK_FORCE
+    FALLBACK_FORCE = False
+    return {"fallback_force": False}
+
+@app.get("/twiml")
+@app.post("/twiml")
 async def twiml():
     xml=('''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -103,7 +120,8 @@ def build_fallback_twiml() -> str:
   <Hangup/>
 </Response>''')
 
-@app.get("/twiml_stream") @app.post("/twiml_stream")
+@app.get("/twiml_stream")
+@app.post("/twiml_stream")
 async def twiml_stream(req: Request):
     if FALLBACK_FORCE or ws_recently_failed():
         return Response(content=build_fallback_twiml(), media_type="text/xml")
@@ -174,7 +192,7 @@ def try_send_sms(call_sid: str, sms_body: str):
         print(f"[SMS] failed: {repr(e)}", flush=True)
         traceback.print_exc()
 
-# ---- WS ----
+# ---- WS / STT ----
 class MyTranscriptHandler(TranscriptResultStreamHandler):
     def __init__(self, output_stream, on_partial, on_final):
         super().__init__(output_stream)
@@ -205,16 +223,19 @@ async def stream_ws(ws: WebSocket):
 
     client = TranscribeStreamingClient(region=AWS_REGION)
     stream = await client.start_stream_transcription(
-        language_code=TRANSCRIBE_LANGUAGE, media_sample_rate_hz=SAMPLE_RATE,
-        media_encoding="pcm", vocabulary_name=TRANSCRIBE_VOCAB or None,
+        language_code=TRANSCRIBE_LANGUAGE,
+        media_sample_rate_hz=SAMPLE_RATE,
+        media_encoding="pcm",
+        vocabulary_name=TRANSCRIBE_VOCAB or None,
     )
 
-    def on_partial(t: str): print(f"[STT] PARTIAL: {t}", flush=True)
+    def on_partial(t: str):
+        print(f"[STT] PARTIAL: {t}", flush=True)
 
     async def do_reply_if_ready(text: str):
         nonlocal replied_once
         if replied_once: return
-        if not (TW_SID and TW_TOKEN): 
+        if not (TW_SID and TW_TOKEN):
             print("[LCC] skipped: TWILIO env not set", flush=True); return
         if not call_sid:
             print("[LCC] skipped: callSid not yet known", flush=True); return
@@ -244,22 +265,36 @@ async def stream_ws(ws: WebSocket):
         try:
             while True:
                 t = await ws.receive_text()
-                try: e = json.loads(t)
-                except Exception: continue
+                try:
+                    e = json.loads(t)
+                except Exception:
+                    continue
                 if e.get("event") != "media":
                     et = e.get("event")
-                    if et in ("connected","start","stop","mark"): print(f"[WS] {et}", flush=True)
+                    if et in ("connected","start","stop","mark"):
+                        print(f"[WS] {et}", flush=True)
                     if et == "start":
-                        print(f"[WS] start payload: {json.dumps(e.get('start',{}), ensure_ascii=False)}", flush=True)
-                        call_sid = e.get("start", {}).get("callSid") or call_sid
-                        if call_sid: print(f"[WS] callSid={call_sid}", flush=True)
-                    if et == "stop": break
+                        try:
+                            print(f"[WS] start payload: {json.dumps(e.get('start',{}), ensure_ascii=False)}", flush=True)
+                        except Exception:
+                            pass
+                        try:
+                            call_sid = e.get("start", {}).get("callSid") or call_sid
+                            if call_sid:
+                                print(f"[WS] callSid={call_sid}", flush=True)
+                        except Exception:
+                            pass
+                    if et == "stop":
+                        break
                     continue
                 b64 = e.get("media",{}).get("payload")
-                if not b64: continue
+                if not b64: 
+                    continue
                 try:
-                    ulaw = base64.b64decode(b64); pcm16 = audioop.ulaw2lin(ulaw, 2)
-                except Exception: continue
+                    ulaw = base64.b64decode(b64)
+                    pcm16 = audioop.ulaw2lin(ulaw, 2)
+                except Exception:
+                    continue
                 await stream.input_stream.send_audio_event(audio_chunk=pcm16)
         except WebSocketDisconnect:
             pass
@@ -267,14 +302,18 @@ async def stream_ws(ws: WebSocket):
             LAST_WS_ERROR_AT = time.time()
             traceback.print_exc()
         finally:
-            try: await stream.input_stream.end_stream()
-            except Exception: pass
+            try: 
+                await stream.input_stream.end_stream()
+            except Exception: 
+                pass
 
     async def read_transcripts():
         try:
-            handler = MyTranscriptHandler(stream.output_stream,
+            handler = MyTranscriptHandler(
+                stream.output_stream,
                 on_partial=lambda txt: on_partial(txt),
-                on_final=lambda txt: asyncio.create_task(on_final_async(txt)),)
+                on_final=lambda txt: asyncio.create_task(on_final_async(txt)),
+            )
             await handler.handle_events()
         except Exception:
             traceback.print_exc()
@@ -291,12 +330,18 @@ async def stream_ws(ws: WebSocket):
         try:
             day = started_at.split("T")[0]
             key = f"calls/{day}/call-{call_id}.json"
-            body = json.dumps({"id": call_id, "started_at": started_at, "finished_at": finished_at,
-                               "language": TRANSCRIBE_LANGUAGE, "text": text_joined}, ensure_ascii=False).encode("utf-8")
+            body = json.dumps({
+                "id": call_id, "started_at": started_at, "finished_at": finished_at,
+                "language": TRANSCRIBE_LANGUAGE, "text": text_joined
+            }, ensure_ascii=False).encode("utf-8")
             s3.put_object(Bucket=S3_BUCKET, Key=key, Body=body, ContentType="application/json")
             print(f"[S3] put s3://{S3_BUCKET}/{key} bytes={len(body)}", flush=True)
         except Exception:
-            print("[S3] put failed", flush=True); traceback.print_exc()
+            print("[S3] put failed", flush=True)
+            traceback.print_exc()
+
         print(f"[WS] CLOSE call={call_id} text='{text_joined}'", flush=True)
-        try: await ws.close()
-        except Exception: pass
+        try: 
+            await ws.close()
+        except Exception: 
+            pass
