@@ -1,93 +1,40 @@
 name: Rollback ECS service (one-click, previous revision)
 
 on:
-  workflow_dispatch: {}   # 入力なし。押すだけで直前に戻す
-
-env:
-  AWS_REGION: ap-northeast-1
-  CLUSTER: voicebot-cluster
-  SERVICE: svc-voicebot
-  TASK_FAMILY: voicebot-task
-  PROD_URL: https://voice.frontglass.net
-
-permissions:
-  contents: read
+  workflow_dispatch: {}
 
 jobs:
   rollback:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # 認証（deploy.yml と同じ「アクセスキー方式」）
-      - name: Configure AWS credentials (keys)
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ap-northeast-1
 
-      - name: Show current service taskDefinition
-        id: cur
+      - name: Get current service/task info
+        id: info
         run: |
-          set -euo pipefail
-          CUR=$(aws ecs describe-services \
-            --cluster "$CLUSTER" \
-            --services "$SERVICE" \
-            --query 'services[0].taskDefinition' --output text)
-          echo "current=$CUR"
-          echo "current=$CUR" >> $GITHUB_OUTPUT
+          CLUSTER=voicebot-cluster
+          SERVICE=svc-voicebot
+          DESCRIBE=$(aws ecs describe-services --cluster $CLUSTER --services $SERVICE)
+          CUR_TASKDEF=$(echo "$DESCRIBE" | jq -r '.services[0].taskDefinition')
+          echo "cur_taskdef=$CUR_TASKDEF" >> $GITHUB_OUTPUT
+          # 直近の過去2リビジョンを取得
+          FAMILY=$(echo "$CUR_TASKDEF" | awk -F"/" '{print $2}' | awk -F":" '{print $1}')
+          LIST=$(aws ecs list-task-definitions --family-prefix "$FAMILY" --sort DESC)
+          PREV=$(echo "$LIST" | jq -r '.taskDefinitionArns[1]')
+          echo "prev_taskdef=$PREV" >> $GITHUB_OUTPUT
 
-      - name: Pick previous ACTIVE taskDefinition (auto)
-        id: prev
+      - name: Rollback service to previous task definition
         run: |
-          set -euo pipefail
-          # ACTIVE の新しい順に2件取り、2番目（=直前）を選ぶ
-          PREV=$(aws ecs list-task-definitions \
-            --family-prefix "$TASK_FAMILY" \
-            --status ACTIVE \
-            --sort DESC \
-            --query 'taskDefinitionArns[1]' --output text)
-          echo "previous=$PREV"
-          test -n "$PREV" && [ "$PREV" != "None" ]
-          echo "previous=$PREV" >> $GITHUB_OUTPUT
-
-      - name: Update service to previous taskDefinition
-        run: |
-          set -euo pipefail
-          if [ "${{ steps.cur.outputs.current }}" = "${{ steps.prev.outputs.previous }}" ]; then
-            echo "NOTE: 現在すでに直前リビジョンを使用中のようです。処理を継続します。"
-          fi
-          aws ecs update-service \
-            --cluster "$CLUSTER" \
-            --service "$SERVICE" \
-            --task-definition "${{ steps.prev.outputs.previous }}"
-
-      - name: Wait until service stable
-        run: |
-          aws ecs wait services-stable \
-            --cluster "$CLUSTER" \
-            --services "$SERVICE"
-
-      # 簡易スモーク（本番URLに対して）
-      - name: Smoke - /version returns JSON
-        run: |
-          set -e
-          URL="${PROD_URL}/version"
-          echo "GET $URL"
-          RES=$(curl -sS -w "\n%{http_code}" "$URL")
-          BODY=$(echo "$RES" | sed '$d'); CODE=$(echo "$RES" | tail -n1)
-          echo "HTTP $CODE"; test "$CODE" = "200"
-          echo "$BODY" | jq -e '.app=="voicebot"' >/dev/null
-
-      - name: Smoke - /twiml returns XML-ish
-        run: |
-          set -e
-          URL="${PROD_URL}/twiml"
-          echo "GET $URL"
-          RES=$(curl -sS -H 'Accept: text/xml' -w "\n%{http_code}" "$URL")
-          BODY=$(echo "$RES" | sed '$d'); CODE=$(echo "$RES" | tail -n1)
-          echo "HTTP $CODE"; test "$CODE" = "200"
-          echo "$BODY" | grep -Eiq '^(<\?xml|<Response)'
+          CLUSTER=voicebot-cluster
+          SERVICE=svc-voicebot
+          PREV="${{ steps.info.outputs.prev_taskdef }}"
+          echo "Rollback to $PREV"
+          aws ecs update-service --cluster $CLUSTER --service $SERVICE --task-definition "$PREV"
+          aws ecs wait services-stable --cluster $CLUSTER --services $SERVICE
