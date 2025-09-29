@@ -1,6 +1,7 @@
- # app.py 〈全文〉 v0.9.0
-# - SMS送信の信頼性改善: 番号未取得なら保留 → /twilio/status で取得後に送信
-# - 他のロジックは v0.8.9 と同等
+# app.py 〈全文〉 v0.9.1
+# - 音声応答強化: 「住所」「営業時間」を口頭で案内（SMSはデフォルト無効）
+# - ENABLE_SMS 環境変数でSMS送信を任意有効化（既定=無効）
+# - 既存機能は維持（/health, /healthz, /version, /twiml[_stream], STT→S3, LCCログ）
 
 from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect, Request, APIRouter, Form
 from datetime import datetime, timezone
@@ -34,15 +35,16 @@ async def twilio_status(
         if To:   d["to"]   = To
         CALL_NUMS[CallSid] = d
 
-        # 保留SMSがあり、番号が揃ったら即送信
-        if CallSid in PENDING_SMS and d.get("from") and d.get("to"):
-            body = PENDING_SMS.pop(CallSid, "")
-            if body:
-                try_send_sms(CallSid, body)
+        # 保留SMSがあり、番号が揃ったら即送信（ENABLE_SMS=1 のときのみ）
+        if os.getenv("ENABLE_SMS", "0").lower() in ("1", "true", "yes"):
+            if CallSid in PENDING_SMS and d.get("from") and d.get("to"):
+                body = PENDING_SMS.pop(CallSid, "")
+                if body:
+                    try_send_sms(CallSid, body)
     return {"ok": True}
 
 APP_NAME = "voicebot"
-APP_VERSION = "0.9.0"
+APP_VERSION = "0.9.1"
 
 SAMPLE_RATE = 8000
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-1")
@@ -53,6 +55,7 @@ S3_BUCKET = os.getenv("TRANSCRIPT_BUCKET", f"voicebot-transcripts-291234479055-{
 TW_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TW_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TW_FROM = os.getenv("TWILIO_FROM", "")  # 任意。未設定なら Call の To を使用
+ENABLE_SMS = os.getenv("ENABLE_SMS", "0").lower() in ("1", "true", "yes")
 
 FALLBACK_FORCE: bool = False
 LAST_WS_ERROR_AT: Optional[float] = None
@@ -73,7 +76,7 @@ def add_recent(call_id: str, text: str, started_at: str, finished_at: str):
 @app.get("/")
 async def root_get():
     return {"message":"ok","app":APP_NAME,"version":APP_VERSION,
-            "twilio_env":{"sid": bool(TW_SID), "token": bool(TW_TOKEN), "from": bool(TW_FROM)},
+            "twilio_env":{"sid": bool(TW_SID), "token": bool(TW_TOKEN), "from": bool(TW_FROM), "enable_sms": ENABLE_SMS},
             "fallback":{"force": FALLBACK_FORCE, "recent_ws_error": ws_recently_failed()}}
 
 @app.get("/health")
@@ -138,7 +141,13 @@ async def twiml_stream(req: Request):
 </Response>''')
     return Response(content=xml, media_type="text/xml")
 
-# ---- 意図判定とSMS本文 ----
+# ====== ここから応答ロジック ======
+
+# ★ 店舗情報（必要に応じて編集）
+STORE_ADDRESS = "埼玉県上尾市菅谷3-4-1"
+# 営業時間（例）：必要に応じて変更OK
+BUSINESS_HOURS_TEXT = "本日の営業時間は朝10時から夜7時までです。"
+
 def classify_intent(text: str) -> str:
     t = text.lower()
     if re.search(r"予約|よやく|book|reserve", t): return "reserve"
@@ -149,15 +158,22 @@ def classify_intent(text: str) -> str:
     return "other"
 
 def make_reply_by_intent(text: str) -> Tuple[str, Optional[str]]:
+    """ return: (voice_reply, sms_key or None) """
     intent = classify_intent(text)
-    if intent == "reserve": return ("ご予約の件ですね。ご希望の日時と内容をお話しください。", None)
-    if intent == "hours":   return ("営業時間をご案内します。SMSのリンクをご確認ください。", "hours")
-    if intent == "access":  return ("所在地をSMSでお送りします。ご確認ください。", "access")
-    if intent == "agent":   return ("担当者への取次ですね。折り返し希望ならお名前と番号をどうぞ。", None)
-    if intent == "faq":     return ("料金やお支払い方法はSMSのリンクをご案内します。", "faq")
+    if intent == "reserve":
+        return ("ご予約の件ですね。ご希望の日時と内容をお話しください。", None)
+    if intent == "hours":
+        # 口頭で案内（SMSは既定では送らない）
+        return (f"{BUSINESS_HOURS_TEXT} 他にお手伝いできることはありますか。", "hours" if ENABLE_SMS else None)
+    if intent == "access":
+        # 口頭で住所を案内（SMSは既定では送らない）
+        return (f"所在地は、{STORE_ADDRESS} です。もう一度お伝えします。{STORE_ADDRESS} です。", "access" if ENABLE_SMS else None)
+    if intent == "agent":
+        return ("担当者への取次ですね。折り返しをご希望でしたらお名前とお電話番号をどうぞ。", None)
+    if intent == "faq":
+        return ("料金やお支払い方法ですね。必要であればSMSのご案内にも対応できます。", "faq" if ENABLE_SMS else None)
     return (f"承知しました。今『{text[:30]}』と伺いました。詳しいご要件を続けてどうぞ。", None)
 
-STORE_ADDRESS = "埼玉県上尾市菅谷3-4-1"
 def sms_template(kind: str) -> str:
     if kind == "hours":
         return "営業時間のご案内です： https://example.com/hours"
@@ -170,8 +186,8 @@ def sms_template(kind: str) -> str:
     return ""
 
 def try_send_sms(call_sid: str, sms_body: str):
-    if not (TW_SID and TW_TOKEN and sms_body):
-        print("[SMS] skipped: env or body missing", flush=True); return
+    if not (ENABLE_SMS and TW_SID and TW_TOKEN and sms_body):
+        print("[SMS] skipped: disabled or env/body missing", flush=True); return
     try:
         tw = TwilioClient(TW_SID, TW_TOKEN)
 
@@ -222,7 +238,7 @@ async def stream_ws(ws: WebSocket):
     started_at = datetime.now(timezone.utc).isoformat()
     print(f"[WS] OPEN call={call_id} at {started_at}", flush=True)
 
-    print(f"[BOOT] TW_SID={bool(TW_SID)} TW_TOKEN={bool(TW_TOKEN)} TW_FROM={bool(TW_FROM)}", flush=True)
+    print(f"[BOOT] TW_SID={bool(TW_SID)} TW_TOKEN={bool(TW_TOKEN)} TW_FROM={bool(TW_FROM)} ENABLE_SMS={ENABLE_SMS}", flush=True)
 
     s3 = boto3.client("s3", region_name=AWS_REGION)
     finals: List[str] = []
@@ -257,11 +273,11 @@ async def stream_ws(ws: WebSocket):
             replied_once = True
             print(f"[LCC] replied via TwiML redirect (callSid={call_sid})", flush=True)
 
-            # SMSが必要なら保留登録し、すぐ一度だけ送信トライ（番号が無ければ /twilio/status 待ちで後送）
-            if sms_key:
+            # SMSは既定で無効。ENABLE_SMS=1 のときのみ保留＆送信を試行
+            if ENABLE_SMS and sms_key:
                 body = sms_template(sms_key)
-                PENDING_SMS[call_sid] = body  # 保留に入れる
-                try_send_sms(call_sid, body)   # 取れれば即送、ダメならstatusで送る
+                PENDING_SMS[call_sid] = body
+                try_send_sms(call_sid, body)
         except Exception as e:
             print(f"[LCC] reply failed: {repr(e)}", flush=True)
             traceback.print_exc()
@@ -295,10 +311,12 @@ async def stream_ws(ws: WebSocket):
                                 print(f"[WS] callSid={call_sid}", flush=True)
                         except Exception:
                             pass
-                    if et == "stop": break
+                    if et == "stop":
+                        break
                     continue
                 b64 = e.get("media",{}).get("payload")
-                if not b64: continue
+                if not b64: 
+                    continue
                 try:
                     ulaw = base64.b64decode(b64)
                     pcm16 = audioop.ulaw2lin(ulaw, 2)
@@ -311,8 +329,10 @@ async def stream_ws(ws: WebSocket):
             LAST_WS_ERROR_AT = time.time()
             traceback.print_exc()
         finally:
-            try: await stream.input_stream.end_stream()
-            except Exception: pass
+            try: 
+                await stream.input_stream.end_stream()
+            except Exception: 
+                pass
 
     async def read_transcripts():
         try:
@@ -348,5 +368,7 @@ async def stream_ws(ws: WebSocket):
             traceback.print_exc()
 
         print(f"[WS] CLOSE call={call_id} text='{text_joined}'", flush=True)
-        try: await ws.close()
-        except Exception: pass
+        try: 
+            await ws.close()
+        except Exception: 
+            pass
