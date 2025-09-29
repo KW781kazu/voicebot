@@ -1,7 +1,6 @@
-# app.py 〈全文〉 v0.8.9
-# - 修正: 複数デコレータを1行に書いていた箇所をすべて分離（SyntaxError対策）
-# - /twilio/status で CallSid→(From,To) をキャッシュして SMS 宛先を確実化
-# - 住所SMS: 「埼玉県上尾市菅谷3-4-1」+ Googleマップリンク
+ # app.py 〈全文〉 v0.9.0
+# - SMS送信の信頼性改善: 番号未取得なら保留 → /twilio/status で取得後に送信
+# - 他のロジックは v0.8.9 と同等
 
 from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect, Request, APIRouter, Form
 from datetime import datetime, timezone
@@ -15,8 +14,9 @@ from amazon_transcribe.model import TranscriptEvent
 import boto3
 from twilio.rest import Client as TwilioClient
 
-# ====== in-memory cache for numbers ======
-CALL_NUMS: Dict[str, Dict[str,str]] = {}  # {callSid: {"from": "+81...", "to": "+81..."}}
+# ====== caches ======
+CALL_NUMS: Dict[str, Dict[str,str]] = {}   # {callSid: {"from": "+81...", "to": "+81..."}}
+PENDING_SMS: Dict[str, str] = {}           # {callSid: "body to send"}
 
 router = APIRouter()
 @router.post("/twilio/status")
@@ -26,16 +26,23 @@ async def twilio_status(
     From: str = Form(default=""),
     To: str = Form(default="")
 ):
+    # Status コールバックで番号をキャッシュ
     print(f"[TW] status sid={CallSid} status={CallStatus} from={From} to={To}", flush=True)
     if CallSid:
         d = CALL_NUMS.get(CallSid, {})
         if From: d["from"] = From
         if To:   d["to"]   = To
         CALL_NUMS[CallSid] = d
+
+        # 保留SMSがあり、番号が揃ったら即送信
+        if CallSid in PENDING_SMS and d.get("from") and d.get("to"):
+            body = PENDING_SMS.pop(CallSid, "")
+            if body:
+                try_send_sms(CallSid, body)
     return {"ok": True}
 
 APP_NAME = "voicebot"
-APP_VERSION = "0.8.9"
+APP_VERSION = "0.9.0"
 
 SAMPLE_RATE = 8000
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-1")
@@ -45,7 +52,7 @@ S3_BUCKET = os.getenv("TRANSCRIPT_BUCKET", f"voicebot-transcripts-291234479055-{
 
 TW_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TW_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TW_FROM = os.getenv("TWILIO_FROM", "")  # 送信元（任意）。未設定なら Call の To を使う
+TW_FROM = os.getenv("TWILIO_FROM", "")  # 任意。未設定なら Call の To を使用
 
 FALLBACK_FORCE: bool = False
 LAST_WS_ERROR_AT: Optional[float] = None
@@ -70,12 +77,10 @@ async def root_get():
             "fallback":{"force": FALLBACK_FORCE, "recent_ws_error": ws_recently_failed()}}
 
 @app.get("/health")
-async def health_get():
-    return {"status":"ok"}
+async def health_get(): return {"status":"ok"}
 
 @app.get("/healthz")
-async def healthz_get():
-    return {"status":"ok"}
+async def healthz_get(): return {"status":"ok"}
 
 @app.get("/version")
 async def version_get():
@@ -133,7 +138,7 @@ async def twiml_stream(req: Request):
 </Response>''')
     return Response(content=xml, media_type="text/xml")
 
-# ---- ルーティング & テンプレ ----
+# ---- 意図判定とSMS本文 ----
 def classify_intent(text: str) -> str:
     t = text.lower()
     if re.search(r"予約|よやく|book|reserve", t): return "reserve"
@@ -170,22 +175,25 @@ def try_send_sms(call_sid: str, sms_body: str):
     try:
         tw = TwilioClient(TW_SID, TW_TOKEN)
 
-        # ① キャッシュ優先
+        # キャッシュ優先
         cached = CALL_NUMS.get(call_sid, {})
         to_number = cached.get("from") or None
         from_number = TW_FROM or cached.get("to") or None
-        if to_number and from_number:
-            print(f"[SMS] using cached nums to={to_number} from={from_number}", flush=True)
-        else:
-            # ② フォールバック：Call API から取得
-            c = tw.calls(call_sid).fetch()
-            to_number = to_number or getattr(c, "from_", None)
-            from_number = from_number or getattr(c, "to", None)
+
+        # フォールバック: Call API（取得できないこともある）
+        if not (to_number and from_number):
+            try:
+                c = tw.calls(call_sid).fetch()
+                to_number = to_number or getattr(c, "from_", None)
+                from_number = from_number or getattr(c, "to", None)
+            except Exception as e:
+                print(f"[SMS] fetch call failed: {repr(e)}", flush=True)
 
         if not (to_number and from_number):
             print(f"[SMS] skipped: number missing to={to_number} from={from_number}", flush=True)
             return
 
+        print(f"[SMS] using nums to={to_number} from={from_number}", flush=True)
         tw.messages.create(to=to_number, from_=from_number, body=sms_body)
         print(f"[SMS] sent to={to_number} from={from_number} body='{sms_body}'", flush=True)
     except Exception as e:
@@ -248,9 +256,12 @@ async def stream_ws(ws: WebSocket):
             tw.calls(call_sid).update(twiml=twml)
             replied_once = True
             print(f"[LCC] replied via TwiML redirect (callSid={call_sid})", flush=True)
+
+            # SMSが必要なら保留登録し、すぐ一度だけ送信トライ（番号が無ければ /twilio/status 待ちで後送）
             if sms_key:
                 body = sms_template(sms_key)
-                try_send_sms(call_sid, body)
+                PENDING_SMS[call_sid] = body  # 保留に入れる
+                try_send_sms(call_sid, body)   # 取れれば即送、ダメならstatusで送る
         except Exception as e:
             print(f"[LCC] reply failed: {repr(e)}", flush=True)
             traceback.print_exc()
@@ -284,12 +295,10 @@ async def stream_ws(ws: WebSocket):
                                 print(f"[WS] callSid={call_sid}", flush=True)
                         except Exception:
                             pass
-                    if et == "stop":
-                        break
+                    if et == "stop": break
                     continue
                 b64 = e.get("media",{}).get("payload")
-                if not b64: 
-                    continue
+                if not b64: continue
                 try:
                     ulaw = base64.b64decode(b64)
                     pcm16 = audioop.ulaw2lin(ulaw, 2)
@@ -302,10 +311,8 @@ async def stream_ws(ws: WebSocket):
             LAST_WS_ERROR_AT = time.time()
             traceback.print_exc()
         finally:
-            try: 
-                await stream.input_stream.end_stream()
-            except Exception: 
-                pass
+            try: await stream.input_stream.end_stream()
+            except Exception: pass
 
     async def read_transcripts():
         try:
@@ -341,7 +348,5 @@ async def stream_ws(ws: WebSocket):
             traceback.print_exc()
 
         print(f"[WS] CLOSE call={call_id} text='{text_joined}'", flush=True)
-        try: 
-            await ws.close()
-        except Exception: 
-            pass
+        try: await ws.close()
+        except Exception: pass
