@@ -1,12 +1,14 @@
-# app.py 〈全文〉 v0.9.1
-# - 音声応答強化: 「住所」「営業時間」を口頭で案内（SMSはデフォルト無効）
-# - ENABLE_SMS 環境変数でSMS送信を任意有効化（既定=無効）
-# - 既存機能は維持（/health, /healthz, /version, /twiml[_stream], STT→S3, LCCログ）
+# app.py 〈全文〉 v0.9.0
+# - STT + S3保存はそのまま
+# - 返答（Live Call Control）に「固定フレーズ応答」を追加
+#   * fixed_replies.reply_fixed() が返せるときはそれを優先
+#   * 合致なしのときは従来の「聞き取れました案内」を返す
+# - 既存の詳細ログは維持
 
-from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect, Request, APIRouter, Form
+from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect
 from datetime import datetime, timezone
-import os, json, traceback, base64, audioop, asyncio, uuid, time, re, urllib.parse
-from typing import Dict, List, Optional, Tuple
+import os, json, traceback, base64, audioop, asyncio, uuid
+from typing import Dict, List, Optional
 
 from amazon_transcribe.client import TranscribeStreamingClient
 from amazon_transcribe.handlers import TranscriptResultStreamHandler
@@ -15,36 +17,11 @@ from amazon_transcribe.model import TranscriptEvent
 import boto3
 from twilio.rest import Client as TwilioClient
 
-# ====== caches ======
-CALL_NUMS: Dict[str, Dict[str,str]] = {}   # {callSid: {"from": "+81...", "to": "+81..."}}
-PENDING_SMS: Dict[str, str] = {}           # {callSid: "body to send"}
-
-router = APIRouter()
-@router.post("/twilio/status")
-async def twilio_status(
-    CallSid: str = Form(default=""),
-    CallStatus: str = Form(default=""),
-    From: str = Form(default=""),
-    To: str = Form(default="")
-):
-    # Status コールバックで番号をキャッシュ
-    print(f"[TW] status sid={CallSid} status={CallStatus} from={From} to={To}", flush=True)
-    if CallSid:
-        d = CALL_NUMS.get(CallSid, {})
-        if From: d["from"] = From
-        if To:   d["to"]   = To
-        CALL_NUMS[CallSid] = d
-
-        # 保留SMSがあり、番号が揃ったら即送信（ENABLE_SMS=1 のときのみ）
-        if os.getenv("ENABLE_SMS", "0").lower() in ("1", "true", "yes"):
-            if CallSid in PENDING_SMS and d.get("from") and d.get("to"):
-                body = PENDING_SMS.pop(CallSid, "")
-                if body:
-                    try_send_sms(CallSid, body)
-    return {"ok": True}
+# ★追加：固定応答ロジック
+from fixed_replies import reply_fixed
 
 APP_NAME = "voicebot"
-APP_VERSION = "0.9.1"
+APP_VERSION = "0.9.0"  # add fixed replies
 
 SAMPLE_RATE = 8000
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-1")
@@ -54,20 +31,12 @@ S3_BUCKET = os.getenv("TRANSCRIPT_BUCKET", f"voicebot-transcripts-291234479055-{
 
 TW_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TW_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TW_FROM = os.getenv("TWILIO_FROM", "")  # 任意。未設定なら Call の To を使用
-ENABLE_SMS = os.getenv("ENABLE_SMS", "0").lower() in ("1", "true", "yes")
-
-FALLBACK_FORCE: bool = False
-LAST_WS_ERROR_AT: Optional[float] = None
-WS_ERROR_WINDOW_SEC = 120
-def ws_recently_failed() -> bool:
-    return (LAST_WS_ERROR_AT is not None) and ((time.time() - LAST_WS_ERROR_AT) < WS_ERROR_WINDOW_SEC)
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
-app.include_router(router)
 
 RECENTS: List[Dict] = []
 MAX_RECENTS = 50
+
 def add_recent(call_id: str, text: str, started_at: str, finished_at: str):
     RECENTS.insert(0, {"id": call_id, "text": text, "started_at": started_at, "finished_at": finished_at})
     if len(RECENTS) > MAX_RECENTS:
@@ -76,33 +45,15 @@ def add_recent(call_id: str, text: str, started_at: str, finished_at: str):
 @app.get("/")
 async def root_get():
     return {"message":"ok","app":APP_NAME,"version":APP_VERSION,
-            "twilio_env":{"sid": bool(TW_SID), "token": bool(TW_TOKEN), "from": bool(TW_FROM), "enable_sms": ENABLE_SMS},
-            "fallback":{"force": FALLBACK_FORCE, "recent_ws_error": ws_recently_failed()}}
+            "twilio_env":{"sid": bool(TW_SID), "token": bool(TW_TOKEN)}}
 
 @app.get("/health")
 async def health_get(): return {"status":"ok"}
 
-@app.get("/healthz")
-async def healthz_get(): return {"status":"ok"}
-
 @app.get("/version")
 async def version_get():
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return {"app":APP_NAME,
-            "deploy_stamp":{"raw":"deployed","time_utc":now_utc,"commit_sha":os.getenv("COMMIT_SHA","unknown")},
-            "version": APP_VERSION}
-
-@app.get("/admin/fallback/on")
-async def fallback_on():
-    global FALLBACK_FORCE
-    FALLBACK_FORCE = True
-    return {"fallback_force": True}
-
-@app.get("/admin/fallback/off")
-async def fallback_off():
-    global FALLBACK_FORCE
-    FALLBACK_FORCE = False
-    return {"fallback_force": False}
+    return {"app":APP_NAME,"deploy_stamp":{"raw":"deployed","time_utc":now_utc,"commit_sha":os.getenv("COMMIT_SHA","unknown")}}
 
 @app.get("/twiml")
 @app.post("/twiml")
@@ -114,109 +65,18 @@ async def twiml():
 </Response>''')
     return Response(content=xml, media_type="text/xml")
 
-def build_reply_twiml(reply_text: str, ws_url: str) -> str:
-    return (f'''<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say language="ja-JP">{reply_text}</Say>
-  <Connect><Stream url="{ws_url}"/></Connect>
-</Response>''')
-
-def build_fallback_twiml() -> str:
-    return ('''<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say language="ja-JP">現在回線が混み合っています。恐れ入りますが、しばらくしてからおかけ直しください。</Say>
-  <Hangup/>
-</Response>''')
-
 @app.get("/twiml_stream")
 @app.post("/twiml_stream")
-async def twiml_stream(req: Request):
-    if FALLBACK_FORCE or ws_recently_failed():
-        return Response(content=build_fallback_twiml(), media_type="text/xml")
+async def twiml_stream():
     ws_url = "wss://voice.frontglass.net/stream"
     xml=(f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say language="ja-JP">お電話ありがとうございます。接続テストを開始します。ご用件をどうぞ。</Say>
+  <Say language="ja-JP">テスト</Say>
+  <Say language="ja-JP">接続テストを開始します。</Say>
   <Connect><Stream url="{ws_url}"/></Connect>
 </Response>''')
     return Response(content=xml, media_type="text/xml")
 
-# ====== ここから応答ロジック ======
-
-# ★ 店舗情報（必要に応じて編集）
-STORE_ADDRESS = "埼玉県上尾市菅谷3-4-1"
-# 営業時間（例）：必要に応じて変更OK
-BUSINESS_HOURS_TEXT = "本日の営業時間は朝10時から夜7時までです。"
-
-def classify_intent(text: str) -> str:
-    t = text.lower()
-    if re.search(r"予約|よやく|book|reserve", t): return "reserve"
-    if re.search(r"営業時間|何時|open|close|いつまで", t): return "hours"
-    if re.search(r"住所|場所|アクセス|行き方|どこ|最寄り|駐車|parking|map|地図", t): return "access"
-    if re.search(r"担当|折り返し|オペレーター|人と話|転送|代表", t): return "agent"
-    if re.search(r"料金|値段|価格|支払|決済|方法|メール", t): return "faq"
-    return "other"
-
-def make_reply_by_intent(text: str) -> Tuple[str, Optional[str]]:
-    """ return: (voice_reply, sms_key or None) """
-    intent = classify_intent(text)
-    if intent == "reserve":
-        return ("ご予約の件ですね。ご希望の日時と内容をお話しください。", None)
-    if intent == "hours":
-        # 口頭で案内（SMSは既定では送らない）
-        return (f"{BUSINESS_HOURS_TEXT} 他にお手伝いできることはありますか。", "hours" if ENABLE_SMS else None)
-    if intent == "access":
-        # 口頭で住所を案内（SMSは既定では送らない）
-        return (f"所在地は、{STORE_ADDRESS} です。もう一度お伝えします。{STORE_ADDRESS} です。", "access" if ENABLE_SMS else None)
-    if intent == "agent":
-        return ("担当者への取次ですね。折り返しをご希望でしたらお名前とお電話番号をどうぞ。", None)
-    if intent == "faq":
-        return ("料金やお支払い方法ですね。必要であればSMSのご案内にも対応できます。", "faq" if ENABLE_SMS else None)
-    return (f"承知しました。今『{text[:30]}』と伺いました。詳しいご要件を続けてどうぞ。", None)
-
-def sms_template(kind: str) -> str:
-    if kind == "hours":
-        return "営業時間のご案内です： https://example.com/hours"
-    if kind == "access":
-        q = urllib.parse.quote(STORE_ADDRESS)
-        maps = f"https://maps.google.com/?q={q}"
-        return f"店舗所在地：{STORE_ADDRESS}\n地図：{maps}"
-    if kind == "faq":
-        return "よくあるご質問と料金一覧： https://example.com/faq"
-    return ""
-
-def try_send_sms(call_sid: str, sms_body: str):
-    if not (ENABLE_SMS and TW_SID and TW_TOKEN and sms_body):
-        print("[SMS] skipped: disabled or env/body missing", flush=True); return
-    try:
-        tw = TwilioClient(TW_SID, TW_TOKEN)
-
-        # キャッシュ優先
-        cached = CALL_NUMS.get(call_sid, {})
-        to_number = cached.get("from") or None
-        from_number = TW_FROM or cached.get("to") or None
-
-        # フォールバック: Call API（取得できないこともある）
-        if not (to_number and from_number):
-            try:
-                c = tw.calls(call_sid).fetch()
-                to_number = to_number or getattr(c, "from_", None)
-                from_number = from_number or getattr(c, "to", None)
-            except Exception as e:
-                print(f"[SMS] fetch call failed: {repr(e)}", flush=True)
-
-        if not (to_number and from_number):
-            print(f"[SMS] skipped: number missing to={to_number} from={from_number}", flush=True)
-            return
-
-        print(f"[SMS] using nums to={to_number} from={from_number}", flush=True)
-        tw.messages.create(to=to_number, from_=from_number, body=sms_body)
-        print(f"[SMS] sent to={to_number} from={from_number} body='{sms_body}'", flush=True)
-    except Exception as e:
-        print(f"[SMS] failed: {repr(e)}", flush=True)
-        traceback.print_exc()
-
-# ---- WS / STT ----
 class MyTranscriptHandler(TranscriptResultStreamHandler):
     def __init__(self, output_stream, on_partial, on_final):
         super().__init__(output_stream)
@@ -224,21 +84,31 @@ class MyTranscriptHandler(TranscriptResultStreamHandler):
         self.on_final = on_final
     async def handle_transcript_event(self, ev: TranscriptEvent):
         for res in ev.transcript.results:
-            if not res.alternatives: continue
+            if not res.alternatives:
+                continue
             text = (res.alternatives[0].transcript or "").strip()
-            if not text: continue
-            if res.is_partial: self.on_partial(text)
-            else: self.on_final(text)
+            if not text:
+                continue
+            if res.is_partial:
+                self.on_partial(text)
+            else:
+                self.on_final(text)
+
+def build_reply_twiml(reply_text: str, ws_url: str) -> str:
+    return (f'''<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say language="ja-JP">{reply_text}</Say>
+  <Connect><Stream url="{ws_url}"/></Connect>
+</Response>''')
 
 @app.websocket("/stream")
 async def stream_ws(ws: WebSocket):
-    global LAST_WS_ERROR_AT
     await ws.accept()
     call_id = str(uuid.uuid4())[:8]
     started_at = datetime.now(timezone.utc).isoformat()
     print(f"[WS] OPEN call={call_id} at {started_at}", flush=True)
 
-    print(f"[BOOT] TW_SID={bool(TW_SID)} TW_TOKEN={bool(TW_TOKEN)} TW_FROM={bool(TW_FROM)} ENABLE_SMS={ENABLE_SMS}", flush=True)
+    print(f"[BOOT] TW_SID={bool(TW_SID)} TW_TOKEN={bool(TW_TOKEN)}", flush=True)
 
     s3 = boto3.client("s3", region_name=AWS_REGION)
     finals: List[str] = []
@@ -257,27 +127,36 @@ async def stream_ws(ws: WebSocket):
         print(f"[STT] PARTIAL: {t}", flush=True)
 
     async def do_reply_if_ready(text: str):
+        """
+        初回の確定結果を受けたら Twilio LCC で即返答。
+        1) 固定フレーズに合致 → その内容を返答
+        2) 合致なし → 既存の「聞き取れました案内」を返答
+        """
         nonlocal replied_once
-        if replied_once: return
-        if not (TW_SID and TW_TOKEN):
-            print("[LCC] skipped: TWILIO env not set", flush=True); return
+        if replied_once:
+            return
+        if not TW_SID or not TW_TOKEN:
+            print("[LCC] skipped: TWILIO env not set", flush=True)
+            return
         if not call_sid:
-            print("[LCC] skipped: callSid not yet known", flush=True); return
+            print("[LCC] skipped: callSid not yet known", flush=True)
+            return
         try:
             tw = TwilioClient(TW_SID, TW_TOKEN)
             ws_url = "wss://voice.frontglass.net/stream"
-            reply, sms_key = make_reply_by_intent(text)
+
+            # ★固定フレーズ応答を優先
+            fixed = reply_fixed(text)
+            if fixed:
+                reply = fixed
+            else:
+                reply = f"こちらはボイスボットです。今、「{text[:30]}」と聞こえました。ご用件をどうぞ。"
+
             twml = build_reply_twiml(reply, ws_url)
-            print(f"[LCC] try redirect callSid={call_sid} text='{text}'", flush=True)
+            print(f"[LCC] try redirect callSid={call_sid} text='{text}' reply='{reply}'", flush=True)
             tw.calls(call_sid).update(twiml=twml)
             replied_once = True
             print(f"[LCC] replied via TwiML redirect (callSid={call_sid})", flush=True)
-
-            # SMSは既定で無効。ENABLE_SMS=1 のときのみ保留＆送信を試行
-            if ENABLE_SMS and sms_key:
-                body = sms_template(sms_key)
-                PENDING_SMS[call_sid] = body
-                try_send_sms(call_sid, body)
         except Exception as e:
             print(f"[LCC] reply failed: {repr(e)}", flush=True)
             traceback.print_exc()
@@ -301,12 +180,13 @@ async def stream_ws(ws: WebSocket):
                     if et in ("connected","start","stop","mark"):
                         print(f"[WS] {et}", flush=True)
                     if et == "start":
+                        # 受け取った start payload をそのまま出力（1行）
                         try:
                             print(f"[WS] start payload: {json.dumps(e.get('start',{}), ensure_ascii=False)}", flush=True)
                         except Exception:
                             pass
                         try:
-                            call_sid = e.get("start", {}).get("callSid") or call_sid
+                            call_sid = e.get("start", {}).get("callSid")
                             if call_sid:
                                 print(f"[WS] callSid={call_sid}", flush=True)
                         except Exception:
@@ -315,7 +195,7 @@ async def stream_ws(ws: WebSocket):
                         break
                     continue
                 b64 = e.get("media",{}).get("payload")
-                if not b64: 
+                if not b64:
                     continue
                 try:
                     ulaw = base64.b64decode(b64)
@@ -326,12 +206,11 @@ async def stream_ws(ws: WebSocket):
         except WebSocketDisconnect:
             pass
         except Exception:
-            LAST_WS_ERROR_AT = time.time()
             traceback.print_exc()
         finally:
-            try: 
+            try:
                 await stream.input_stream.end_stream()
-            except Exception: 
+            except Exception:
                 pass
 
     async def read_transcripts():
@@ -368,7 +247,7 @@ async def stream_ws(ws: WebSocket):
             traceback.print_exc()
 
         print(f"[WS] CLOSE call={call_id} text='{text_joined}'", flush=True)
-        try: 
+        try:
             await ws.close()
-        except Exception: 
+        except Exception:
             pass
